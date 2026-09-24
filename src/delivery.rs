@@ -162,7 +162,10 @@ enum Typed {
 /// touches before it lists, so a pull that saw the file reads as fresh here.
 fn type_item(root: &Path, herdr: &Herdr, item: &Item, now: i64) -> Typed {
     let file = item_path(root, item);
-    let claimed = file.with_file_name(format!(".{}.typing", item.id));
+    let claimed = claimed_path(root, item);
+    // The claim's age is what `fallback` reads to put back one whose typist
+    // died; stamped first, so the claim is never born looking old.
+    let _ = std::fs::File::options().write(true).open(&file).and_then(|f| f.set_modified(std::time::SystemTime::now()));
     if std::fs::rename(&file, &claimed).is_err() {
         return Typed::Done;
     }
@@ -183,6 +186,27 @@ fn type_item(root: &Path, herdr: &Herdr, item: &Item, now: i64) -> Typed {
     Typed::Done
 }
 
+fn claimed_path(root: &Path, item: &Item) -> PathBuf {
+    pane_dir(root, &item.socket, &item.pane_id).join(format!(".{}.typing", item.id))
+}
+
+/// Claims older than `FALLBACK_MS` whose typist was killed before it typed
+/// or put them back: back in the queue, or nothing would ever deliver them.
+fn release_stale_claims(dir: &Path, now_ms: i64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(id) = entry.file_name().to_str().and_then(|n| n.strip_prefix('.')?.strip_suffix(".typing")).filter(|id| valid_id(id)).map(str::to_string) else {
+            continue;
+        };
+        let claimed_ms = entry.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis() as i64);
+        if now_ms - claimed_ms >= FALLBACK_MS {
+            let _ = std::fs::rename(entry.path(), dir.join(format!("{id}.json")));
+        }
+    }
+}
+
 /// Whether herdr-projects sends anything to this pane: an open local thread
 /// of a project runs in it, or it works in a project folder (a coordinator)
 /// or below one. Only such panes get a heartbeat, so the user's other OMP
@@ -201,17 +225,31 @@ fn claimed(root: &Path, pane: &progress::Current) -> bool {
     })
 }
 
-/// Whether the calling pane is claimed, and its queued items. The heartbeat
-/// is recorded only for a claimed pane.
+/// Whether the calling pane is claimed, and its queued items. Only a claimed
+/// pane gets a heartbeat, so only it is handed items: an unclaimed pull
+/// would race the fallback, which sees no heartbeat. Items queued for an
+/// earlier terminal with this pane id are dropped. A pane herdr cannot
+/// resolve fails, so the extension keeps what it delivered and its cadence.
 fn pulled(ctx: &Ctx) -> Result<(bool, Vec<Item>)> {
     let Some(pane) = progress::current(ctx.env, ctx.runner) else {
+        if ctx.env.var("HERDR_ENV") == Some("1") && ctx.env.var("HERDR_PANE_ID").is_some() {
+            bail!("herdr did not resolve this pane; try again");
+        }
         return Ok((false, Vec::new()));
     };
-    let claimed = claimed(&ctx.root, &pane);
-    if claimed {
-        progress::touch_channel(&ctx.root, &pane.socket, &pane.pane_id, &pane.terminal_id, &pane.agent, progress::now())?;
+    if !claimed(&ctx.root, &pane) {
+        return Ok((false, Vec::new()));
     }
-    Ok((claimed, pending(&ctx.root, &pane.socket, &pane.pane_id)))
+    progress::touch_channel(&ctx.root, &pane.socket, &pane.pane_id, &pane.terminal_id, &pane.agent, progress::now())?;
+    let mut items = pending(&ctx.root, &pane.socket, &pane.pane_id);
+    items.retain(|item| {
+        let stale = differs(&item.terminal_id, &pane.terminal_id);
+        if stale {
+            remove(&ctx.root, item);
+        }
+        !stale
+    });
+    Ok((true, items))
 }
 
 /// `channel pull --agent omp`, run by the extension in its pane: records the
@@ -269,6 +307,7 @@ pub fn fallback(root: &Path, herdr: &Herdr, socket: &str, panes: &[Pane], agents
             continue;
         };
         let agent = agents.iter().find(|a| a.pane_id == pane.pane_id);
+        release_stale_claims(&entry.path(), now_ms);
         for item in pending(root, socket, &pane.pane_id) {
             if agent.is_none_or(|a| a.agent != "omp") || differs(&item.terminal_id, &pane.terminal_id) {
                 remove(root, &item);
@@ -400,6 +439,40 @@ mod tests {
     }
 
     #[test]
+    fn a_pull_fails_in_a_pane_herdr_cannot_resolve_so_the_extension_keeps_its_state() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        enqueue(&root, SOCKET, "w1:p1", "brief", "b", 1).unwrap();
+        let runner = FakeRunner::new();
+        runner.on("pane current", fail(1, r#"{"error":{"code":"unreachable","message":"refused"}}"#));
+        let env = in_pane(home.path());
+        let ctx = Ctx { env: &env, root: root.clone(), config_dir: root.join("cfg"), runner: &runner, detached_ticker: false };
+        assert!(pulled(&ctx).is_err());
+
+        let outside = Env::for_test(home.path(), &[("HERDR_PANE_ID", "w1:p1")]);
+        let ctx = Ctx { env: &outside, root: root.clone(), config_dir: root.join("cfg"), runner: &runner, detached_ticker: false };
+        assert_eq!(pulled(&ctx).unwrap(), (false, Vec::new()));
+    }
+
+    #[test]
+    fn a_pull_drops_items_queued_for_an_earlier_terminal_with_the_pane_id() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        progress::touch_channel(&root, SOCKET, "w1:p1", "term_old", "omp", 1).unwrap();
+        let old = enqueue(&root, SOCKET, "w1:p1", "brief", "old", 1).unwrap();
+        let unknown = enqueue(&root, SOCKET, "w1:p1", "brief", "unknown", 2).unwrap();
+        std::fs::write(item_path(&root, &unknown), serde_json::to_string(&Item { terminal_id: String::new(), ..unknown.clone() }).unwrap()).unwrap();
+        let env = in_pane(home.path());
+        // `pane_ctx` reports terminal `term`.
+        let (claimed, items) = pulled(&pane_ctx(&env, &FakeRunner::new(), &root, &project.canonical_dir())).unwrap();
+        assert!(claimed);
+        assert_eq!(items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(), ["unknown"]);
+        assert!(!item_path(&root, &old).exists());
+    }
+
+    #[test]
     fn only_panes_herdr_projects_sends_to_are_claimed_and_get_a_heartbeat() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
@@ -409,10 +482,13 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         let fresh = || progress::channel_fresh(&root, SOCKET, "w1:p1", progress::now());
 
-        // Some other OMP session: no heartbeat, never routed.
+        // Some other OMP session: no heartbeat, never routed, and handed
+        // nothing, since the fallback sees no heartbeat and types it too.
+        let queued = enqueue(&root, SOCKET, "w1:p1", "brief", "for a claimed pane", 1).unwrap();
         let runner = FakeRunner::new();
-        assert!(!pulled(&pane_ctx(&env, &runner, &root, elsewhere.path())).unwrap().0);
+        assert_eq!(pulled(&pane_ctx(&env, &runner, &root, elsewhere.path())).unwrap(), (false, Vec::new()));
         assert!(progress::load(&root, SOCKET, "w1:p1").is_none());
+        remove(&root, &queued);
 
         // A thread's pane in this session; a resolved one or another session's does not count.
         project.update_coordinator(|c| c.socket = SOCKET.into()).unwrap();
@@ -600,5 +676,29 @@ mod tests {
         }
         assert!(!pane_dir(root, SOCKET, "w1:p4").exists());
         assert_eq!(pending(root, "/tmp/b.sock", "w1:p4").len(), 1);
+    }
+
+    #[test]
+    fn fallback_puts_back_a_claim_whose_typist_died() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path();
+        let created = 1_000_000_000_000;
+        let now_ms = created + FALLBACK_MS + 1;
+        let at = |ms: i64| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms as u64);
+        let claim = |item: &Item, ms: i64| {
+            std::fs::rename(item_path(root, item), claimed_path(root, item)).unwrap();
+            std::fs::File::options().write(true).open(claimed_path(root, item)).unwrap().set_modified(at(ms)).unwrap();
+        };
+        let dead = enqueue(root, SOCKET, "w1:p1", "brief", "dead", created).unwrap();
+        claim(&dead, created);
+        // Claimed a moment ago: its typist is still at work.
+        let busy = enqueue(root, SOCKET, "w1:p1", "brief", "busy", created + 1).unwrap();
+        claim(&busy, now_ms - 1);
+        let (pane, agent) = omp_pane("w1:p1", "");
+        let runner = FakeRunner::new();
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        fallback(root, &herdr(&runner), SOCKET, &[pane], &[agent], now_ms);
+        assert_eq!(prompts(&runner), ["dead"]);
+        assert!(claimed_path(root, &busy).exists());
     }
 }

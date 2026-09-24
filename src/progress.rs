@@ -105,14 +105,19 @@ fn update(root: &Path, socket: &str, pane_id: &str, change: impl FnOnce(&mut Rec
 }
 
 /// The heartbeat of `channel pull`: marks the pane's channel live without
-/// touching the report, so heartbeats never age or refresh progress.
+/// touching the report, so heartbeats never age or refresh progress. The
+/// live terminal id always wins, so items queued now are stamped with it;
+/// a report of an earlier terminal with this pane id is dropped with it.
 pub fn touch_channel(root: &Path, socket: &str, pane_id: &str, terminal_id: &str, agent: &str, now: i64) -> Result<()> {
     update(root, socket, pane_id, |record| {
-        record.socket = socket.to_string();
-        record.pane_id = pane_id.to_string();
-        if record.terminal_id.is_empty() {
+        if !terminal_id.is_empty() && record.terminal_id != terminal_id {
+            if !record.terminal_id.is_empty() {
+                *record = Record::default();
+            }
             record.terminal_id = terminal_id.to_string();
         }
+        record.socket = socket.to_string();
+        record.pane_id = pane_id.to_string();
         if record.agent.is_empty() {
             record.agent = agent.to_string();
         }
@@ -495,9 +500,19 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let report = Record { socket: "/a.sock".into(), pane_id: "w1:p1".into(), terminal_id: "t1".into(), agent: "omp".into(), activity: "Testing".into(), percent: Some(40), reported_at: 900, reminded_at: 950, session_started_at: 800, ..Record::default() };
         save(root.path(), &report).unwrap();
-        touch_channel(root.path(), "/a.sock", "w1:p1", "t2", "other", 1000).unwrap();
+        touch_channel(root.path(), "/a.sock", "w1:p1", "t1", "other", 1000).unwrap();
         let touched = load(root.path(), "/a.sock", "w1:p1").unwrap();
-        assert_eq!(touched, Record { channel: CHANNEL_OMP.into(), channel_seen: 1000, ..report }, "only the channel fields change");
+        assert_eq!(touched, Record { channel: CHANNEL_OMP.into(), channel_seen: 1000, ..report.clone() }, "only the channel fields change");
+        // A pull that does not know its terminal keeps the stored one.
+        touch_channel(root.path(), "/a.sock", "w1:p1", "", "other", 1001).unwrap();
+        assert_eq!(load(root.path(), "/a.sock", "w1:p1").unwrap().terminal_id, "t1");
+
+        // A new terminal with this pane id (herdr restarted): its id wins, so
+        // items queued now are its own, and the old terminal's report goes.
+        touch_channel(root.path(), "/a.sock", "w1:p1", "t2", "omp", 1002).unwrap();
+        let restarted = load(root.path(), "/a.sock", "w1:p1").unwrap();
+        assert_eq!((restarted.terminal_id.as_str(), restarted.agent.as_str(), restarted.channel_seen), ("t2", "omp", 1002));
+        assert!(!restarted.reported());
 
         // No record yet: the heartbeat creates one bound to the pane, with no report.
         touch_channel(root.path(), "/a.sock", "w1:p2", "t3", "omp", 1000).unwrap();

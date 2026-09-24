@@ -510,8 +510,8 @@ pub fn write_priming(project: &Project, prefix: &str) -> Result<()> {
     Ok(())
 }
 
-const OMP_CONFIG: &str = ".omp/config.yml";
-const OMP_CONFIG_MARKER: &str = "# herdr-projects: managed";
+pub const OMP_CONFIG: &str = ".omp/config.yml";
+pub const OMP_CONFIG_MARKER: &str = "# herdr-projects: managed";
 
 /// OMP layers `<cwd>/.omp/config.yml` (no walk-up) over the user's config, and
 /// only the coordinator runs in exactly this folder. A

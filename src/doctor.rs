@@ -162,13 +162,34 @@ fn report(
         let problems = project::priming_problems(&project, &prefix);
         if problems.is_empty() {
             check(&mut out, Some(true), &label, "AGENTS.md, CLAUDE.md link, .omp/config.yml and uploads/ are in place".into());
-        } else if fix {
-            match project::write_priming(&project, &prefix) {
-                Ok(()) => check(&mut out, Some(true), &label, format!("fixed: {}", problems.join("; "))),
-                Err(error) => check(&mut out, Some(false), &label, format!("could not fix ({error:#}): {}", problems.join("; "))),
-            }
         } else {
-            check(&mut out, None, &label, format!("{}; `doctor --fix` repairs this", problems.join("; ")));
+            // Re-check after the write: `write_priming` leaves a file it
+            // cannot read (or will not overwrite) alone, and ignores a failed
+            // `.omp/config.yml` write, so only what is gone counts as fixed.
+            let mut left = problems.clone();
+            if fix {
+                match project::write_priming(&project, &prefix) {
+                    Ok(()) => {
+                        left = project::priming_problems(&project, &prefix);
+                        let fixed: Vec<&str> = problems.iter().filter(|p| !left.contains(p)).map(String::as_str).collect();
+                        if !fixed.is_empty() {
+                            check(&mut out, Some(true), &label, format!("fixed: {}", fixed.join("; ")));
+                        }
+                    }
+                    Err(error) => {
+                        check(&mut out, Some(false), &label, format!("could not fix ({error:#}): {}", problems.join("; ")));
+                        left.clear();
+                    }
+                }
+            }
+            let (kept, repairable): (Vec<String>, Vec<String>) = left.into_iter().partition(|p| p.contains("cannot be read"));
+            if !kept.is_empty() {
+                check(&mut out, None, &label, format!("{}; left alone; fix its permissions or remove it", kept.join("; ")));
+            }
+            if !repairable.is_empty() {
+                let hint = if fix { "" } else { "; `doctor --fix` repairs this" };
+                check(&mut out, None, &label, format!("{}{hint}", repairable.join("; ")));
+            }
         }
         for other in &slugs {
             if other > slug && crate::names::collide(slug, other) {
@@ -341,9 +362,15 @@ fn report(
             Err(error) => check(&mut out, None, label, format!("{error:#}")),
         }
         // The project `.omp/config.yml` replaces the `bash.patterns` list
-        // instead of merging it, so the user's own rules stop applying there.
-        let config = crate::setup::omp_agent_dir(env).join("config.yml");
-        if std::fs::read_to_string(&config).is_ok_and(|t| has_bash_patterns(&t)) {
+        // instead of merging it, so the user's own rules stop applying there:
+        // only in projects whose file is still ours. OMP loads the first of
+        // `config.yml` and `config.yaml` that exists.
+        let managed = slugs.iter().filter_map(|slug| project::Project::load(root, slug).ok()).any(|p| {
+            std::fs::read_to_string(p.dir().join(project::OMP_CONFIG)).is_ok_and(|t| t.starts_with(project::OMP_CONFIG_MARKER))
+        });
+        let agent_dir = crate::setup::omp_agent_dir(env);
+        let config = ["config.yml", "config.yaml"].map(|name| agent_dir.join(name)).into_iter().find(|p| p.exists());
+        if let Some(config) = config.filter(|c| managed && std::fs::read_to_string(c).is_ok_and(|t| has_bash_patterns(&t))) {
             check(&mut out, None, "omp bash.patterns", format!("your global OMP bash.patterns ({}) do not apply in OMP coordinator sessions: the project .omp/config.yml list replaces them (see docs/operations.md#omp)", config.display()));
         }
     }
@@ -534,6 +561,37 @@ mod tests {
     }
 
     #[test]
+    fn fix_reports_only_what_it_fixed_and_names_files_it_leaves_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let root = home.path().join("root");
+        let cfg = home.path().join("cfg");
+        let flags = SessionFlags::default();
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let omp = project.dir().join(".omp");
+        std::fs::create_dir_all(&omp).unwrap();
+
+        // A file it cannot read is left alone, and `--fix` does not claim it.
+        std::fs::write(project.dir().join(project::OMP_CONFIG), b"\xff\xfe").unwrap();
+        let (text, _) = report(&env, &root, &cfg, &flags, &runner, false, None);
+        assert!(text.contains("[warn] files demo: .omp/config.yml cannot be read (") && text.contains("); left alone; fix its permissions or remove it"), "{text}");
+        assert!(text.contains("[warn] files demo: AGENTS.md is missing; CLAUDE.md is not a link to AGENTS.md; `doctor --fix` repairs this"), "{text}");
+        let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, None);
+        assert!(text.contains("[ok  ] files demo: fixed: AGENTS.md is missing; CLAUDE.md is not a link to AGENTS.md\n"), "{text}");
+        assert!(text.contains("[warn] files demo: .omp/config.yml cannot be read (") && !text.contains("fixed: .omp"), "{text}");
+        assert_eq!(std::fs::read(project.dir().join(project::OMP_CONFIG)).unwrap(), b"\xff\xfe");
+
+        // A missing file it cannot write stays reported, with no `fixed`.
+        std::fs::remove_file(project.dir().join(project::OMP_CONFIG)).unwrap();
+        std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, None);
+        std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(text.contains("[warn] files demo: .omp/config.yml is missing\n") && !text.contains("fixed:"), "{text}");
+    }
+
+    #[test]
     fn routines_skipped_for_want_of_a_coordinator_are_named() {
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
@@ -670,9 +728,23 @@ mod tests {
         let runner = runner_with_herdr("herdr 0.9.1\n");
         let root = home.path().join("root");
         let report_text = || report(&env, &root, &home.path().join("cfg"), &SessionFlags::default(), &runner, false, None).0;
+        let rules = "bash:\n  patterns:\n    - match: \"rm *\"\n      approval: deny\n";
+        // OMP loads `config.yml`, else `config.yaml`.
+        std::fs::write(agent.join("config.yaml"), rules).unwrap();
+        // No project with our managed `.omp/config.yml`: nothing replaces them.
         assert!(!report_text().contains("omp bash.patterns"));
-        std::fs::write(agent.join("config.yml"), "bash:\n  patterns:\n    - match: \"rm *\"\n      approval: deny\n").unwrap();
-        assert!(report_text().contains("[warn] omp bash.patterns: your global OMP bash.patterns"));
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        project::write_omp_config(&project, "hp").unwrap();
+        assert!(report_text().contains(&format!("[warn] omp bash.patterns: your global OMP bash.patterns ({})", agent.join("config.yaml").display())));
+        // `config.yml` wins when both exist.
+        std::fs::write(agent.join("config.yml"), "theme: dark\n").unwrap();
+        assert!(!report_text().contains("omp bash.patterns"));
+        std::fs::remove_file(agent.join("config.yml")).unwrap();
+        // The user took the file over (marker removed): the warning goes away.
+        let file = project.dir().join(project::OMP_CONFIG);
+        let own = std::fs::read_to_string(&file).unwrap().replacen(project::OMP_CONFIG_MARKER, "# mine", 1);
+        std::fs::write(&file, own).unwrap();
+        assert!(!report_text().contains("omp bash.patterns"));
     }
 
     #[test]

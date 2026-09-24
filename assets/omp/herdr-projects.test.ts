@@ -252,6 +252,33 @@ test("a pane no project claims pulls at most every 30 s; a claimed one every tic
   expect(pulls()).toBe(5);
 });
 
+test("channel items: a failed pull keeps claimed and delivered, so an item whose ack failed is sent once", async () => {
+  const { ctx, sent, emit, tick } = await load();
+  emit("session_start");
+  ctx.idle = false;
+  // The fake ack removes nothing, like a failed one; an empty answer is a failed pull.
+  pull([{ id: "1-a", kind: "brief", text: "only" }]);
+  await tick();
+  writeFileSync(join(dir, "pull.json"), "");
+  await tick();
+  pull([{ id: "1-a", kind: "brief", text: "only" }]);
+  advance(2000);
+  await tick();
+  expect(sent).toEqual([["only", { deliverAs: "followUp" }]]);
+  expect(pulls()).toBe(3);
+  expect(acks()).toEqual(["--root /r channel ack 1-a", "--root /r channel ack 1-a"]);
+});
+
+test("a failed first pull retries on the next tick instead of waiting 30 s", async () => {
+  const { emit, tick } = await load();
+  emit("session_start");
+  writeFileSync(join(dir, "pull.json"), "");
+  await tick();
+  advance(2000);
+  await tick();
+  expect(pulls()).toBe(2);
+});
+
 test("channel items: a busy session queues every item as a follow-up; nothing pulled means no ack", async () => {
   const { ctx, sent, emit, tick } = await load();
   emit("session_start");
@@ -316,6 +343,33 @@ test("a PostToolUse reminder is appended once to the next tool result, and the h
   expect(postToolUse()).toHaveLength(2);
 });
 
+test("a PostToolUse reminder skips error results and waits for the next successful one", async () => {
+  writeFileSync(join(dir, "hook-PostToolUse.json"), hookOutput("PostToolUse", "REMINDER"));
+  const { emit } = await load();
+  emit("session_start");
+  const out = [{ type: "text", text: "out" }];
+  emit("tool_result", { toolName: "bash", isError: false, input: { command: "ls" }, content: out });
+  // Both in one synchronous step: the reminder cannot arrive between them.
+  const result = await until(() => {
+    expect(emit("tool_result", { toolName: "bash", isError: true, input: {}, content: out })).toBeUndefined();
+    return emit("tool_result", { toolName: "bash", isError: false, input: {}, content: out });
+  }, "the reminder");
+  expect(result).toEqual({ content: [...out, { type: "text", text: "REMINDER" }] });
+});
+
+test("a pending PostToolUse reminder is dropped when the next prompt starts", async () => {
+  writeFileSync(join(dir, "hook-PostToolUse.json"), hookOutput("PostToolUse", "REMINDER"));
+  const { emit } = await load();
+  emit("session_start");
+  emit("tool_result", { toolName: "bash", isError: false, input: { command: "ls" }, content: [] });
+  await until(() => calls().some(([, stdin]) => stdin?.includes("PostToolUse")), "the PostToolUse hook");
+  // A real delay: a pending reminder is invisible until a successful result
+  // takes it, so no signal says the hook child's answer has been stored.
+  await Bun.sleep(300);
+  await emit("before_agent_start", { prompt: "next" });
+  expect(emit("tool_result", { toolName: "bash", isError: false, input: {}, content: [] })).toBeUndefined();
+});
+
 test("a SessionStart text is kept when a session switch happens while a prompt awaits the old one", async () => {
   writeFileSync(join(dir, "hook-SessionStart.json"), hookOutput("SessionStart", "INSTRUCTIONS"));
   const { emit } = await load();
@@ -324,6 +378,20 @@ test("a SessionStart text is kept when a session switch happens while a prompt a
   emit("session_switch", { reason: "new" });
   await first;
   expect(await emit("before_agent_start", { prompt: "again" })).toEqual({ message: { customType: "herdr-projects", content: "INSTRUCTIONS", display: false } });
+});
+
+test("a session switch resets the record only after reports the old session queued", async () => {
+  const { emit, tick } = await load();
+  emit("session_start");
+  writeFileSync(join(dir, "pull-slow"), "");
+  const ticked = tick();
+  // Queued behind the slow pull, like a Done flushed by the agent_end of the run /new aborts.
+  emit("tool_result", todoResult(todo("completed", "in_progress")));
+  emit("session_switch", { reason: "new" });
+  await ticked;
+  const order = () => calls().map(([args, stdin]) => (args.startsWith("--root /r report") ? "report" : stdin?.includes("SessionStart") ? "start" : "")).filter(Boolean);
+  await until(() => order().length >= 3, "the second SessionStart");
+  expect(order()).toEqual(["start", "report", "start"]);
 });
 
 test("a reload during a run skips SessionStart; compaction sends the instructions again with the next prompt", async () => {

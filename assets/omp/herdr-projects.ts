@@ -24,8 +24,9 @@ const RUN_TIMEOUT_MS = 5000;
 // session's shell is not the pane's agent and must stay silent.
 const ENABLED = process.env.HERDR_ENV === "1" && !!process.env.HERDR_SOCKET_PATH && !!process.env.HERDR_PANE_ID && process.env.OMPCODE !== "1";
 
-// One binary call at a time: reports must reach the record in order. Hooks
-// bypass it so a prompt never waits behind a slow pull.
+// One binary call at a time: reports must reach the record in order. Prompt
+// and tool hooks bypass it so a prompt never waits behind a slow pull;
+// SessionStart resets the record, so it waits for earlier reports.
 let queue: Promise<unknown> = Promise.resolve();
 
 function run(args: string[], input = ""): Promise<string> {
@@ -53,8 +54,8 @@ function spawnOnce(args: string[], input: string): Promise<string> {
   return promise;
 }
 
-async function hook(name: string, extra: Record<string, unknown> = {}): Promise<string> {
-  const out = await spawnOnce(["hook", "--agent", "omp"], JSON.stringify({ hook_event_name: name, ...extra }));
+async function hook(name: string, extra: Record<string, unknown> = {}, queued = false): Promise<string> {
+  const out = await (queued ? run : spawnOnce)(["hook", "--agent", "omp"], JSON.stringify({ hook_event_name: name, ...extra }));
   try {
     const text = JSON.parse(out)?.hookSpecificOutput?.additionalContext;
     return typeof text === "string" ? text : "";
@@ -154,7 +155,7 @@ export default function (pi) {
     reminder = undefined;
     const phases = latestPhases(ctx);
     polledKey = phases ? JSON.stringify(phases) : undefined;
-    startText = instructions ? hook("SessionStart") : undefined;
+    startText = instructions ? hook("SessionStart", {}, true) : undefined;
   }
 
   // Deduped by content: the poll later sees the same list the tool_result
@@ -200,7 +201,8 @@ export default function (pi) {
       flush();
       const now = Date.now();
       if (!claimed && pulledAt !== undefined && now - pulledAt < UNCLAIMED_PULL_MS) return;
-      pulledAt = now;
+      // A failed pull (herdr unreachable, timeout) keeps claimed and delivered
+      // and retries on the next tick.
       let pulled;
       try {
         pulled = JSON.parse(await run(["channel", "pull", "--agent", "omp"]));
@@ -208,6 +210,7 @@ export default function (pi) {
         return;
       }
       if (typeof pulled?.claimed !== "boolean" || !Array.isArray(pulled.items)) return;
+      pulledAt = now;
       claimed = pulled.claimed;
       const items = pulled.items.filter((item) => typeof item?.id === "string" && typeof item.text === "string");
       const ids = new Set(items.map((item) => item.id));
@@ -255,6 +258,8 @@ export default function (pi) {
 
   pi.on("before_agent_start", async (_event, ctx) => {
     if (!root(ctx)) return undefined;
+    // The prompt's own hook asks for a fresh estimate: an older reminder is stale.
+    reminder = undefined;
     // Captured before awaiting: a session switch meanwhile sets the new session's text.
     const pending = startText;
     startText = undefined;
@@ -269,7 +274,7 @@ export default function (pi) {
   // The hook resets the record, so the current state must be reported again.
   pi.on("session_compact", (_event, ctx) => {
     if (!root(ctx)) return;
-    startText = hook("SessionStart", { source: "compact" });
+    startText = hook("SessionStart", { source: "compact" }, true);
     void startText.then(() => {
       reportedKey = undefined;
       flush();
@@ -280,10 +285,11 @@ export default function (pi) {
     if (!root(ctx)) return undefined;
     const details = event?.details;
     if (event?.toolName === "todo" && !event.isError && details?.op !== "view" && Array.isArray(details?.phases)) setPhases(details.phases);
-    // A reminder from an earlier PostToolUse rides on this result, so it
-    // reaches the main turn without a user message or a per-request hook.
-    const text = reminder;
-    reminder = undefined;
+    // A reminder from an earlier PostToolUse rides on the next successful
+    // result, so it reaches the main turn without a user message or a
+    // per-request hook. An error result may be an abort: the reminder waits.
+    const text = event?.isError ? undefined : reminder;
+    if (text) reminder = undefined;
     const now = Date.now();
     if (now - postToolAt >= POST_TOOL_MS) {
       postToolAt = now;
