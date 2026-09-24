@@ -504,7 +504,9 @@ pub fn write_priming(project: &Project, prefix: &str) -> Result<()> {
         std::fs::create_dir(dir.join("uploads"))?;
     }
     write_default_routine(project)?;
-    write_omp_config(project)?;
+    // Only OMP reads this file: a failure here must not stop `open` or
+    // `doctor --fix` for other harnesses; `priming_problems` reports it.
+    let _ = write_omp_config(project, prefix);
     Ok(())
 }
 
@@ -514,42 +516,54 @@ const OMP_CONFIG_MARKER: &str = "# herdr-projects: managed";
 /// OMP layers `<cwd>/.omp/config.yml` (no walk-up) over the user's config, and
 /// only the coordinator runs in exactly this folder. A
 /// `deny` or `prompt` pattern holds even under `approvalMode: yolo`, but only
-/// for the bash tool: `eval` can reach a shell too, hence its own `prompt`.
-/// Advice-level, like COORDINATOR.md: a wrapped or renamed binary evades it.
-const OMP_CONFIG_TEMPLATE: &str = "\
-# herdr-projects: managed. `doctor --fix` rewrites this file; delete this line to keep your own edits.
-# The coordinator never runs these itself; resolve, sweep, archive and delete wait for you to confirm.
-tools:
-  approval:
-    eval: prompt
-bash:
-  patterns:
-    - match: \"*herdr-projects* routine approve*\"
-      approval: deny
-    - match: \"*herdr-projects* configure*\"
-      approval: deny
-    - match: \"*herdr-projects* unconfigure*\"
-      approval: deny
-    - match: \"*herdr-projects* thread resolve*\"
-      approval: prompt
-    - match: \"*herdr-projects* sweep*\"
-      approval: prompt
-    - match: \"*herdr-projects* archive*\"
-      approval: prompt
-    - match: \"*herdr-projects* delete*\"
-      approval: prompt
-";
+/// for the bash tool: `eval` and `debug` can reach a shell too, hence their own
+/// `prompt`. OMP replaces arrays whole, so this list replaces the user's global
+/// `bash.patterns` here (`doctor` warns). Every rule starts with the exact
+/// prefix the coordinator is told to use, so a heredoc body or a slug such as
+/// `configure-ci` never matches. Advice-level, like COORDINATOR.md: a wrapped
+/// or renamed binary evades it.
+// ponytail: a quoted prefix (a path with spaces) misses OMP's per-segment
+// check, which strips quotes; `cd x && <prefix> configure` then passes.
+fn omp_config(prefix: &str) -> String {
+    let rules = [
+        ("routine approve *", "deny"),
+        ("configure", "deny"),
+        ("configure *", "deny"),
+        ("unconfigure", "deny"),
+        ("unconfigure *", "deny"),
+        ("thread resolve *", "prompt"),
+        ("sweep", "prompt"),
+        ("sweep *", "prompt"),
+        ("archive *", "prompt"),
+        ("delete *", "prompt"),
+    ];
+    let mut text = format!(
+        "{OMP_CONFIG_MARKER}. `doctor --fix` rewrites this file; delete this line to keep your own edits.\n\
+         # The coordinator never runs these itself; resolve, sweep, archive and delete wait for you to confirm.\n\
+         tools:\n  approval:\n    eval: prompt\n    debug: prompt\nbash:\n  patterns:\n"
+    );
+    for (sub, approval) in rules {
+        // A JSON string is a valid YAML double-quoted scalar.
+        let pattern = serde_json::to_string(&format!("{prefix} {sub}")).expect("a string serializes");
+        text.push_str(&format!("    - match: {pattern}\n      approval: {approval}\n"));
+    }
+    text
+}
 
-/// Writes `.omp/config.yml` unless a file without our marker is there (the
+/// Writes `.omp/config.yml` when it is missing or an out-of-date managed file.
+/// A file without our marker, or one that cannot be read, is left alone (the
 /// user's own config is never overwritten). Returns whether it wrote.
-pub fn write_omp_config(project: &Project) -> Result<bool> {
+pub fn write_omp_config(project: &Project, prefix: &str) -> Result<bool> {
     let path = project.dir().join(OMP_CONFIG);
+    let wanted = omp_config(prefix);
     match std::fs::read_to_string(&path) {
-        Ok(text) if text == OMP_CONFIG_TEMPLATE || !text.starts_with(OMP_CONFIG_MARKER) => return Ok(false),
-        _ => {}
+        Ok(text) if text == wanted || !text.starts_with(OMP_CONFIG_MARKER) => return Ok(false),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Ok(false),
     }
     std::fs::create_dir_all(project.dir().join(".omp"))?;
-    write_atomic(&path, OMP_CONFIG_TEMPLATE.as_bytes())?;
+    write_atomic(&path, wanted.as_bytes())?;
     Ok(true)
 }
 
@@ -581,8 +595,9 @@ pub fn priming_problems(project: &Project, prefix: &str) -> Vec<String> {
         problems.push("routines/pr-followup.md is missing".into());
     }
     match std::fs::read_to_string(dir.join(OMP_CONFIG)) {
-        Err(_) => problems.push(".omp/config.yml is missing".into()),
-        Ok(text) if text.starts_with(OMP_CONFIG_MARKER) && text != OMP_CONFIG_TEMPLATE => problems.push(".omp/config.yml is out of date".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => problems.push(".omp/config.yml is missing".into()),
+        Err(error) => problems.push(format!(".omp/config.yml cannot be read ({error})")),
+        Ok(text) if text.starts_with(OMP_CONFIG_MARKER) && text != omp_config(prefix) => problems.push(".omp/config.yml is out of date".into()),
         // The user's own file (no marker) is theirs to keep.
         Ok(_) => {}
     }
@@ -634,7 +649,8 @@ pub fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<P
     )?;
     write_atomic(&dir.join("TASKS.md"), TASKS_TEMPLATE.as_bytes())?;
     write_atomic(&dir.join(PR_FOLLOWUP), PR_FOLLOWUP_TEMPLATE.as_bytes())?;
-    write_omp_config(&project)?;
+    // The same prefix AGENTS.md and COORDINATOR.md tell the coordinator to use.
+    write_omp_config(&project, &crate::coordinator::current_prefix(root)?)?;
     write_json(&project.state_dir().join("project.json"), &ProjectState::default())?;
     // PROJECT.md last: a folder without it is not a project, so a half-made
     // skeleton is never picked up by `list` or the ticker.
@@ -787,39 +803,65 @@ mod tests {
     fn omp_config_is_written_refreshed_and_never_replaces_a_foreign_file() {
         let root = tempfile::tempdir().unwrap();
         let project = create(root.path(), "demo", "", vec![]).unwrap();
-        let prefix = format!("{} --root {}", std::env::current_exe().unwrap().display(), root.path().display());
+        let prefix = crate::coordinator::current_prefix(root.path()).unwrap();
         let path = project.dir().join(OMP_CONFIG);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), OMP_CONFIG_TEMPLATE, "`create` writes it");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), omp_config(&prefix), "`create` writes it for the coordinator's prefix");
         std::fs::remove_file(&path).unwrap();
         assert!(priming_problems(&project, &prefix).iter().any(|p| p.contains(".omp/config.yml is missing")));
         write_priming(&project, &prefix).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), OMP_CONFIG_TEMPLATE);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), omp_config(&prefix));
         assert!(priming_problems(&project, &prefix).is_empty());
-        assert!(!write_omp_config(&project).unwrap(), "a current file is left alone");
+        assert!(!write_omp_config(&project, &prefix).unwrap(), "a current file is left alone");
 
-        // An older managed file is reported and rewritten.
+        // An older managed file, or one for another binary or root, is reported and rewritten.
         std::fs::write(&path, format!("{OMP_CONFIG_MARKER}\nbash: {{}}\n")).unwrap();
         assert!(priming_problems(&project, &prefix).iter().any(|p| p.contains("out of date")));
-        assert!(write_omp_config(&project).unwrap());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), OMP_CONFIG_TEMPLATE);
+        assert!(write_omp_config(&project, &prefix).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), omp_config(&prefix));
+        assert!(priming_problems(&project, "/other/hp --root /r").iter().any(|p| p.contains("out of date")));
 
         // The user's own config (marker removed) is theirs: kept and not a problem.
         std::fs::write(&path, "tools:\n  approvalMode: yolo\n").unwrap();
         write_priming(&project, &prefix).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "tools:\n  approvalMode: yolo\n");
         assert!(priming_problems(&project, &prefix).is_empty());
+
+        // A file that cannot be read as text is never replaced.
+        std::fs::write(&path, b"\xff\xfe").unwrap();
+        write_priming(&project, &prefix).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"\xff\xfe");
+        assert!(priming_problems(&project, &prefix).iter().any(|p| p.contains("cannot be read")));
+
+        // A directory in the way is left alone too.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        write_priming(&project, &prefix).unwrap();
+        assert!(path.is_dir());
+
+        // A failed write does not fail the other priming files (`open` for any harness).
+        use std::os::unix::fs::PermissionsExt;
+        let omp = project.dir().join(".omp");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::remove_file(project.dir().join("AGENTS.md")).unwrap();
+        let result = write_priming(&project, &prefix);
+        std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        result.unwrap();
+        assert!(project.dir().join("AGENTS.md").is_file());
     }
 
-    /// OMP's `bash.patterns` semantics: `*` matches anything, the rest is literal,
-    /// the whole command must match, first rule wins.
-    fn omp_approval(command: &str) -> Option<&'static str> {
+    /// OMP's `bash.patterns` semantics (tools/bash.ts @740f3e3154): whitespace
+    /// runs, newlines included, become one space; `*` matches anything, the rest
+    /// is literal; a `deny`/`prompt` rule fires on the whole command or on any
+    /// segment split at newlines and `;&|()`; the first matching rule wins.
+    fn omp_approval(config: &str, command: &str) -> Option<String> {
         fn glob(pattern: &str, text: &str) -> bool {
             let parts: Vec<&str> = pattern.split('*').collect();
             let (first, last) = (parts[0], parts[parts.len() - 1]);
             if parts.len() == 1 {
                 return pattern == text;
             }
-            if !text.starts_with(first) || !text[first.len()..].ends_with(last) {
+            if !text.starts_with(first) || text.len() < first.len() + last.len() || !text[first.len()..].ends_with(last) {
                 return false;
             }
             let mut rest = &text[first.len()..text.len() - last.len()];
@@ -831,11 +873,15 @@ mod tests {
             }
             true
         }
-        let lines: Vec<&str> = OMP_CONFIG_TEMPLATE.lines().collect();
+        let normalize = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut candidates = vec![normalize(command)];
+        candidates.extend(command.split(['\n', ';', '&', '|', '(', ')']).map(normalize).filter(|s| !s.is_empty()));
+        let lines: Vec<&str> = config.lines().collect();
         lines.windows(2).find_map(|pair| {
-            let pattern = pair[0].trim().strip_prefix("- match: \"")?.strip_suffix('"')?;
+            let pattern: String = serde_json::from_str(pair[0].trim().strip_prefix("- match: ")?).ok()?;
             let approval = pair[1].trim().strip_prefix("approval: ")?;
-            glob(pattern, command).then_some(approval)
+            let pattern = normalize(&pattern);
+            candidates.iter().any(|c| glob(&pattern, c)).then(|| approval.to_string())
         })
     }
 
@@ -843,23 +889,42 @@ mod tests {
     fn omp_config_gates_exactly_the_user_only_subcommands() {
         // The coordinator calls the absolute binary, and the default root has the name in it too.
         let hp = "/home/u/.local/bin/herdr-projects --root /home/u/.herdr-projects";
-        for (sub, want) in [
-            ("routine approve demo watch", Some("deny")),
-            ("configure --clients omp", Some("deny")),
-            ("unconfigure", Some("deny")),
-            ("thread resolve demo t-0001", Some("prompt")),
-            ("sweep demo --yes", Some("prompt")),
-            ("archive demo", Some("prompt")),
-            ("delete demo --force", Some("prompt")),
-            ("unarchive demo", None),
-            ("context demo", None),
-            ("thread start demo --title x --task-file -", None),
-            ("routine list demo", None),
-            ("thread show demo t-0001", None),
+        let config = omp_config(hp);
+        let deny = Some("deny".to_string());
+        let prompt = Some("prompt".to_string());
+        for (command, want) in [
+            (format!("{hp} routine approve demo watch"), deny.clone()),
+            (format!("{hp} configure --clients omp"), deny.clone()),
+            (format!("{hp} configure"), deny.clone()),
+            (format!("{hp} unconfigure"), deny.clone()),
+            (format!("cd /tmp && {hp} unconfigure --clients omp"), deny.clone()),
+            (format!("{hp} thread resolve demo t-0001"), prompt.clone()),
+            (format!("{hp} sweep"), prompt.clone()),
+            (format!("{hp} sweep demo --yes"), prompt.clone()),
+            (format!("{hp} archive demo"), prompt.clone()),
+            (format!("{hp}  delete demo --force"), prompt.clone()),
+            (format!("{hp} unarchive demo"), None),
+            (format!("{hp} context demo"), None),
+            (format!("{hp} routine list demo"), None),
+            (format!("{hp} thread show demo t-0001"), None),
+            // Slugs that start with a gated word.
+            (format!("{hp} context configure-ci"), None),
+            (format!("{hp} inbox done archive-sync 20260917T000001Z-routine-r-1"), None),
+            (format!("{hp} thread resolve-later"), None),
+            // Briefs and follow-ups that mention the gated words.
+            (
+                format!("{hp} thread start demo --title \"delete stale flags\" --task-file - <<'TASK'\nconfigure the lint job\narchive old logs, then sweep and delete the rest\nthread resolve nothing\nunconfigure it\nroutine approve nothing\nTASK"),
+                None,
+            ),
+            (format!("{hp} thread prompt demo t-0001 --text-file - <<'EOF'\nPlease configure CI and delete dead code.\nEOF"), None),
         ] {
-            assert_eq!(omp_approval(&format!("{hp} {sub}")), want, "{sub}");
+            assert_eq!(omp_approval(&config, &command), want, "{command}");
         }
-        assert_eq!(OMP_CONFIG_TEMPLATE.lines().find(|l| l.trim_start().starts_with("eval:")).map(str::trim), Some("eval: prompt"));
+        // Another binary or root is not this coordinator's command.
+        assert_eq!(omp_approval(&config, "/opt/herdr-projects --root /home/u/.herdr-projects configure"), None);
+        for tool in ["eval: prompt", "debug: prompt"] {
+            assert!(config.lines().any(|l| l.trim() == tool), "{tool}");
+        }
     }
 
     #[test]

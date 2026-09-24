@@ -8,7 +8,8 @@ const dir = mkdtempSync(join(tmpdir(), "hp-omp-ext-"));
 const binary = join(dir, "herdr-projects");
 const log = join(dir, "calls.log");
 // Logs "argv<TAB>stdin" per call and answers from canned files: hook-<Event>.json
-// for `hook`, pull.json (consumed once) for `channel pull`.
+// for `hook`, pull.json (consumed once, else pull-default.json) for `channel pull`,
+// which sleeps 1 s while pull-slow exists.
 writeFileSync(
   binary,
   `#!/bin/sh
@@ -17,7 +18,7 @@ input=$(cat)
 printf '%s\\t%s\\n' "$*" "$input" >> "$dir/calls.log"
 case "$*" in
   *"hook --agent omp"*) f="$dir/hook-$(printf '%s' "$input" | sed -n 's/.*"hook_event_name":"\\([A-Za-z]*\\)".*/\\1/p').json" ;;
-  *"channel pull"*) f="$dir/pull.json" ;;
+  *"channel pull"*) [ -f "$dir/pull-slow" ] && sleep 1; f="$dir/pull.json"; [ -f "$f" ] || f="$dir/pull-default.json" ;;
   *) f="" ;;
 esac
 if [ -n "$f" ] && [ -f "$f" ]; then cat "$f"; case "$f" in */pull.json) rm -f "$f" ;; esac; fi
@@ -63,6 +64,21 @@ const reports = () => calls().map(([args]) => args).filter((args) => args.starts
 
 const todo = (...statuses) => [{ name: "Build", tasks: statuses.map((status, i) => ({ content: `task ${i}`, status })) }];
 const todoResult = (phases) => ({ toolName: "todo", isError: false, input: {}, details: { op: "done", phases } });
+const todoEntry = (phases) => ({ type: "message", message: { role: "toolResult", toolName: "todo", isError: false, details: { op: "done", phases } } });
+const pull = (items, claimed = true, file = "pull.json") => writeFileSync(join(dir, file), JSON.stringify({ claimed, items }));
+const pulls = () => calls().filter(([args]) => args === "--root /r channel pull --agent omp").length;
+const acks = () => calls().map(([args]) => args).filter((args) => args.startsWith("--root /r channel ack"));
+
+// Hooks run outside the extension's call queue in a real child process and expose
+// no promise, so a test can only poll for their effect (bounded, 3 s).
+async function until(condition: () => unknown, what: string) {
+  for (let i = 0; i < 300; i += 1) {
+    const value = condition();
+    if (value) return value;
+    await Bun.sleep(10);
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
 
 let now = 1_000_000;
 function advance(ms) {
@@ -72,7 +88,9 @@ function advance(ms) {
 
 beforeEach(() => {
   rmSync(log, { force: true });
-  for (const name of ["hook-SessionStart.json", "hook-UserPromptSubmit.json", "hook-PostToolUse.json", "pull.json"]) rmSync(join(dir, name), { force: true });
+  for (const name of ["hook-SessionStart.json", "hook-UserPromptSubmit.json", "hook-PostToolUse.json", "pull.json", "pull-default.json", "pull-slow"]) rmSync(join(dir, name), { force: true });
+  // A claimed pane pulls every tick, so awaiting a tick settles earlier reports.
+  pull([], true, "pull-default.json");
   advance(60_000);
 });
 afterEach(() => setSystemTime());
@@ -102,7 +120,7 @@ test("todo results report percent and activity, change-only and at most every 2 
 
 test("todo phases persisted by the eval bridge are picked up by the poll; the list at session start is a baseline", async () => {
   const { ctx, emit, tick } = await load();
-  ctx.entries = [{ type: "message", message: { role: "toolResult", toolName: "todo", isError: false, details: { op: "done", phases: todo("completed", "pending") } } }];
+  ctx.entries = [todoEntry(todo("completed", "pending"))];
   emit("session_start");
   await tick();
   expect(reports()).toEqual([]);
@@ -163,26 +181,88 @@ test("a finished list reports 100 only when the agent ends without continuing", 
   expect(reports()[1]).toBe("--root /r report --percent=100 --activity=Done");
 });
 
-test("channel items: an idle session gets the first as a prompt, the rest as follow-ups, then all are acked", async () => {
-  const { sent, emit, tick } = await load();
+test("the poll seeing a todo result already applied does not undo a Done held by the throttle", async () => {
+  const { ctx, emit, tick } = await load();
   emit("session_start");
-  writeFileSync(join(dir, "pull.json"), JSON.stringify([{ id: "1-a", kind: "brief", text: "first" }, { id: "2-b", kind: "nudge", text: "second" }]));
+  const phases = todo("completed", "completed");
+  emit("tool_result", todoResult(phases));
+  ctx.entries.push(todoEntry(phases));
+  await tick();
+  advance(500);
+  emit("agent_end", { messages: [] });
+  advance(2000);
+  await tick();
+  advance(3000);
+  await tick();
+  expect(reports()).toEqual(["--root /r report --percent=99 --activity=Working", "--root /r report --percent=100 --activity=Done"]);
+});
+
+test("channel items: an idle session gets only the first item as a prompt; the rest follow on the next tick", async () => {
+  const { ctx, sent, emit, tick } = await load();
+  emit("session_start");
+  pull([{ id: "1-a", kind: "brief", text: "first" }, { id: "2-b", kind: "nudge", text: "second" }]);
+  await tick();
+  expect(sent).toEqual([["first"]]);
+  expect(acks()).toEqual(["--root /r channel ack 1-a"]);
+  ctx.idle = false;
+  pull([{ id: "2-b", kind: "nudge", text: "second" }]);
   await tick();
   expect(sent).toEqual([["first"], ["second", { deliverAs: "followUp" }]]);
-  expect(calls().map(([args]) => args)).toContain("--root /r channel ack 1-a 2-b");
+  expect(acks()).toEqual(["--root /r channel ack 1-a", "--root /r channel ack 2-b"]);
+});
+
+test("channel items: an item whose ack failed is acked again, never delivered twice", async () => {
+  const { ctx, sent, emit, tick } = await load();
+  emit("session_start");
+  ctx.idle = false;
+  // The fake ack removes nothing, like a failed one: the next pull returns the item again.
+  pull([{ id: "1-a", kind: "brief", text: "only" }], true, "pull-default.json");
+  await tick();
+  await tick();
+  expect(sent).toEqual([["only", { deliverAs: "followUp" }]]);
+  expect(acks()).toEqual(["--root /r channel ack 1-a", "--root /r channel ack 1-a"]);
+  // Once a pull no longer returns it, the id is forgotten.
+  pull([]);
+  await tick();
+  await tick();
+  expect(sent).toEqual([["only", { deliverAs: "followUp" }], ["only", { deliverAs: "followUp" }]]);
+});
+
+test("a pane no project claims pulls at most every 30 s; a claimed one every tick", async () => {
+  const { emit, tick } = await load();
+  emit("session_start");
+  pull([], false, "pull-default.json");
+  await tick();
+  advance(2000);
+  await tick();
+  expect(pulls()).toBe(1);
+  advance(28_000);
+  await tick();
+  expect(pulls()).toBe(2);
+  pull([], true, "pull-default.json");
+  advance(2000);
+  await tick();
+  expect(pulls()).toBe(2);
+  advance(28_000);
+  await tick();
+  advance(2000);
+  await tick();
+  advance(2000);
+  await tick();
+  expect(pulls()).toBe(5);
 });
 
 test("channel items: a busy session queues every item as a follow-up; nothing pulled means no ack", async () => {
   const { ctx, sent, emit, tick } = await load();
   emit("session_start");
   ctx.idle = false;
-  writeFileSync(join(dir, "pull.json"), JSON.stringify([{ id: "1-a", kind: "brief", text: "only" }]));
+  pull([{ id: "1-a", kind: "brief", text: "only" }]);
   await tick();
+  pull([]);
   await tick();
   expect(sent).toEqual([["only", { deliverAs: "followUp" }]]);
-  const args = calls().map(([a]) => a);
-  expect(args.filter((a) => a === "--root /r channel pull --agent omp")).toHaveLength(2);
-  expect(args.filter((a) => a.startsWith("--root /r channel ack"))).toEqual(["--root /r channel ack 1-a"]);
+  expect(pulls()).toBe(2);
+  expect(acks()).toEqual(["--root /r channel ack 1-a"]);
 });
 
 test("disabled outside a Herdr pane and in a nested omp", async () => {
@@ -217,23 +297,66 @@ test("SessionStart instructions arrive with the first prompt, UserPromptSubmit t
   ]);
 });
 
-test("a PostToolUse reminder is appended once to the next context, and the hook runs at most every 20 s", async () => {
+test("a PostToolUse reminder is appended once to the next tool result, and the hook runs at most every 20 s", async () => {
   writeFileSync(join(dir, "hook-PostToolUse.json"), hookOutput("PostToolUse", "REMINDER"));
   const { emit, tick } = await load();
   emit("session_start");
-  emit("tool_result", { toolName: "bash", isError: false, input: { command: "ls -la" }, content: [] });
-  emit("tool_result", { toolName: "bash", isError: false, input: { command: "pwd" }, content: [] });
-  await tick();
-  const history = [{ role: "user", content: "hi", timestamp: 1 }];
-  const result = await emit("context", { messages: history });
-  expect(result.messages.slice(0, 1)).toEqual(history);
-  expect(result.messages[1]).toMatchObject({ role: "user", content: [{ type: "text", text: "REMINDER" }] });
-  expect(await emit("context", { messages: history })).toBeUndefined();
+  const out = [{ type: "text", text: "out" }];
+  expect(emit("tool_result", { toolName: "bash", isError: false, input: { command: "ls -la" }, content: out })).toBeUndefined();
+  // Results inside the 20 s window start no hook and carry nothing until the first hook answers.
+  const result = await until(() => emit("tool_result", { toolName: "bash", isError: false, input: { command: "pwd" }, content: out }), "the reminder");
+  expect(result).toEqual({ content: [...out, { type: "text", text: "REMINDER" }] });
+  expect(emit("tool_result", { toolName: "bash", isError: false, input: { command: "pwd" }, content: out })).toBeUndefined();
 
   const postToolUse = () => calls().filter(([, stdin]) => stdin?.includes("PostToolUse")).map(([, stdin]) => stdin);
   expect(postToolUse()).toEqual(['{"hook_event_name":"PostToolUse","tool_input":{"command":"bash ls -la"}}']);
   advance(20_000);
   emit("tool_result", { toolName: "bash", isError: false, input: { command: "pwd" }, content: [] });
-  await tick();
+  await until(() => postToolUse().length >= 2, "the second PostToolUse hook");
   expect(postToolUse()).toHaveLength(2);
+});
+
+test("a SessionStart text is kept when a session switch happens while a prompt awaits the old one", async () => {
+  writeFileSync(join(dir, "hook-SessionStart.json"), hookOutput("SessionStart", "INSTRUCTIONS"));
+  const { emit } = await load();
+  emit("session_start");
+  const first = emit("before_agent_start", { prompt: "hi" });
+  emit("session_switch", { reason: "new" });
+  await first;
+  expect(await emit("before_agent_start", { prompt: "again" })).toEqual({ message: { customType: "herdr-projects", content: "INSTRUCTIONS", display: false } });
+});
+
+test("a reload during a run skips SessionStart; compaction sends the instructions again with the next prompt", async () => {
+  writeFileSync(join(dir, "hook-SessionStart.json"), hookOutput("SessionStart", "INSTRUCTIONS"));
+  const { ctx, emit } = await load();
+  ctx.idle = false;
+  emit("session_start");
+  expect(await emit("before_agent_start", { prompt: "hi" })).toBeUndefined();
+  emit("session_compact", { compactionEntry: {}, fromExtension: false });
+  expect(await emit("before_agent_start", { prompt: "again" })).toEqual({ message: { customType: "herdr-projects", content: "INSTRUCTIONS", display: false } });
+  expect(calls().filter(([, stdin]) => stdin?.includes("SessionStart")).map(([, stdin]) => stdin)).toEqual(['{"hook_event_name":"SessionStart","source":"compact"}']);
+});
+
+test("a prompt's hooks do not wait behind a slow pull", async () => {
+  writeFileSync(join(dir, "hook-UserPromptSubmit.json"), hookOutput("UserPromptSubmit", "PROMPT"));
+  const { emit, tick } = await load();
+  emit("session_start");
+  writeFileSync(join(dir, "pull-slow"), "");
+  let pulled = false;
+  const ticked = tick().then(() => (pulled = true));
+  expect(await emit("before_agent_start", { prompt: "hi" })).toEqual({ message: { customType: "herdr-projects", content: "PROMPT", display: false } });
+  expect(pulled).toBe(false);
+  await ticked;
+});
+
+test("compaction resets the record, so the current todo state is reported again", async () => {
+  const { emit, tick } = await load();
+  emit("session_start");
+  emit("tool_result", todoResult(todo("completed", "in_progress")));
+  await tick();
+  advance(3000);
+  emit("session_compact", { compactionEntry: {}, fromExtension: false });
+  await emit("before_agent_start", { prompt: "go on" });
+  await tick();
+  expect(reports()).toEqual(["--root /r report --percent=50 --activity=task 1", "--root /r report --percent=50 --activity=task 1"]);
 });

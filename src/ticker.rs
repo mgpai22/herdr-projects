@@ -309,8 +309,8 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     // Channel items no extension took go out as keystrokes, once per session.
     let now_ms = jiff::Timestamp::now().as_millisecond();
     for (socket, lists) in &sessions.lists {
-        if lists.is_some() {
-            crate::delivery::fallback(&ctx.root, &Herdr::new(ctx.env.herdr_bin(), socket, ctx.runner), socket, now_ms);
+        if let Some((agents, panes)) = lists {
+            crate::delivery::fallback(&ctx.root, &Herdr::new(ctx.env.herdr_bin(), socket, ctx.runner), socket, panes, agents, now_ms);
         }
     }
     for (project, seen) in &reachable {
@@ -534,7 +534,8 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
         if t.prompt_pending && live.agent_state.as_deref().is_some_and(crate::herdr::ready_state) {
             // Queued for the OMP extension counts as delivered: it hands the
             // brief over itself, or the fallback types it.
-            match crate::delivery::send(&project.root, herdr, socket, &t.pane_id, t.is_remote(), "brief", &thread::launch_prompt(slug, &t.id, &t.agent)) {
+            let routed = crate::delivery::routed(&project.root, socket, &t.pane_id, t.is_remote());
+            match crate::delivery::send(&project.root, herdr, socket, &t.pane_id, routed, "brief", &thread::launch_prompt(slug, &t.id, &t.agent)) {
                 Ok(_) => delivered = true,
                 Err(error) => pass.error = pass.error.or(Some(anyhow::anyhow!("{}: brief prompt: {error}", t.id))),
             }

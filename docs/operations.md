@@ -61,7 +61,7 @@ Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`
 | `configure [--clients claude,codex,omp] [--key K] [--hooks-only] [--dry-run]`, `unconfigure`, `report`, `progress` | Sidebar, keys, hooks, the OMP extension, the `autoproject` skill, self-reports. |
 | `open-file <path>`, `open-url <url>` | Open a text file in a new tab with `$EDITOR`, or a PR in the browser. |
 | `ticker start \| run \| stop \| status`, `doctor [--fix]`, `skill` | Housekeeping. |
-| `update [--check]` | Update to the newest release: fetch, rebuild, `doctor --fix`, restart the ticker. |
+| `update [--check]` | Update to the newest release: fetch, rebuild, `doctor --fix`, restart the ticker. Refuses on an OMP fork build (see OMP). |
 
 ## Groups
 
@@ -186,7 +186,7 @@ herdr-projects configure --clients omp        # or claude,codex,omp
 
 `herdr-projects update` refuses on a fork build. To update, run `git -C ~/dev/herdr-projects-omp pull`, then `HERDR_PROJECTS_BUILD=source sh scripts/install.sh` in the checkout, then `herdr-projects doctor --fix`, `herdr-projects ticker stop` and `herdr-projects ticker start`.
 
-**What `configure` installs.** `configure` picks OMP by itself when its agent folder exists. The folder is `$PI_CODING_AGENT_DIR` when that is set, else `~/.omp/agent`. Named OMP profiles (`~/.omp/profiles/<name>/agent`) are not supported.
+**What `configure` installs.** `configure` picks OMP by itself when its agent folder exists. The folder is `$PI_CODING_AGENT_DIR` when that is set, else `~/.omp/agent`. Named OMP profiles (`~/.omp/profiles/<name>/agent`) are not supported. If you set `PI_CODING_AGENT_DIR`, set the same value in the shell where you run `configure` and in the Herdr server's environment: the Herdr **doctor** and **configure** actions run with the server's environment, and with a different value they look in another folder and install a second copy there.
 
 - `<agent folder>/extensions/herdr-projects.ts`, with this binary's path and root written into it. `unconfigure` removes it only when it is unchanged. `doctor` reports it as ok, outdated, missing or foreign; `doctor --fix` rewrites it when `configure` installed it or when it is an older version of ours. A file of that name that is not ours is never touched.
 - `<agent folder>/skills/autoproject`, a link to the `autoproject` skill. It is skipped when `~/.agents/skills/autoproject` already links the same skill, because OMP reads that folder too.
@@ -195,7 +195,7 @@ herdr-projects configure --clients omp        # or claude,codex,omp
 
 - **Hooks.** It runs `herdr-projects hook --agent omp`, the entry point the Claude Code and Codex hooks use, and gives the model the same progress instructions and reminders. The reminder after tool use comes at most once every 20 seconds.
 - **Progress from the todo list.** When the agent keeps a todo list, the extension reports the percentage of tasks done (abandoned ones do not count) and the current task as the activity. It reports `Waiting for you` while the agent asks you something or waits for an approval, and `100` with `Done` when every task is done and the agent stops. It reports only changes, at most once every 2 seconds. An agent with no todo list reports by hand as before. Both kinds of report go to the same record, and the newest one wins.
-- **Channel delivery.** Every 2 seconds the extension fetches prompts that the binary queued for its pane (`channel pull`), gives them to the agent as user messages (as a follow-up while it works), and confirms them (`channel ack`). The binary queues a brief, a nudge, a `thread prompt` or a `coordinator prompt` under `<root>/.channel/` in place of typing it into the pane when that pane's extension checked in during the last 10 seconds. A queued prompt never merges with text you have half-typed, and it reaches an agent that waits for an approval once you answer. The ticker types an item that nothing picks up in 60 seconds with `herdr agent prompt`, as before. Threads on other machines always get typed prompts.
+- **Channel delivery.** Every 2 seconds the extension fetches prompts that the binary queued for its pane (`channel pull`), gives them to the agent as user messages (as a follow-up while it works), and confirms them (`channel ack`). The binary queues a brief, a nudge, a `thread prompt` or a `coordinator prompt` under `<root>/.channel/` in place of typing it into the pane when that pane's extension checked in during the last 10 seconds. A queued prompt never merges with text you have half-typed, and it reaches an agent that waits for an approval once you answer. The extension confirms a prompt as soon as it hands it to OMP, so a queued follow-up that you pull back into the editor with Esc is yours to keep or delete: it is not sent again. The ticker types an item that nothing picks up in 60 seconds with `herdr agent prompt`, as before. Threads on other machines always get typed prompts.
 
 **The coordinator's approval rules.** Every project folder has `.omp/config.yml`, written by `new`, `open` and `doctor --fix`. OMP reads it only in a session whose working directory is exactly the project folder, so it applies to the coordinator and not to threads. It holds even when your own OMP config sets `approvalMode: yolo`:
 
@@ -203,9 +203,13 @@ herdr-projects configure --clients omp        # or claude,codex,omp
 | --- | --- |
 | `routine approve`, `configure`, `unconfigure` | refused (`deny`); the coordinator tells you the command to run |
 | `thread resolve`, `sweep`, `archive`, `delete` | asks you to confirm in the coordinator's pane (`prompt`) |
-| the `eval` tool | asks you to confirm each call, because `eval` can start a shell that the patterns above do not see |
+| the `eval` and `debug` tools | ask you to confirm each call, because both can start a process that the patterns above do not see |
 
-The first line of the file is `# herdr-projects: managed`, and `doctor --fix` rewrites such a file when it is out of date. To keep your own version, delete that line: the binary then never writes the file again. OMP replaces a list setting as a whole, so in the coordinator's session this file's `bash.patterns` takes the place of any `bash.patterns` in your own OMP config; copy rules you need there into your own version of the file. The rules match `*herdr-projects* <subcommand>*`, so they are advice, not a sandbox: a copied or renamed binary, `sh -c '...'` and similar wrappers get past them. The words also match inside other commands, for example a `thread next --add` line that contains ` delete`. A subagent of the coordinator cannot answer a confirmation, so `eval` and the confirmed commands are refused there.
+The first line of the file is `# herdr-projects: managed`, and `doctor --fix` rewrites such a file when it is out of date, for example after the binary or the root moved. To keep your own version, delete that line: the binary then never writes the file again. A file it cannot read is left alone too, and `doctor` names it.
+
+OMP replaces a list setting as a whole, so in the coordinator's session this file's `bash.patterns` takes the place of any `bash.patterns` in your own OMP config (`<agent folder>/config.yml`). `doctor` warns when your own config has `bash.patterns`. To keep those rules for the coordinator, copy them into your own version of the file.
+
+Each rule starts with the exact `<binary> --root <root>` prefix the coordinator is told to use, for example `<binary> --root <root> configure *`. A slug such as `configure-ci` or a brief that mentions "delete" does not match. OMP also checks each part of a compound command, so `cd x && <binary> --root <root> sweep` still asks. The rules are advice, not a sandbox: another path to the binary, a copied or renamed binary, `sh -c '...'` and similar wrappers get past them. When the binary or root path contains a space, the prefix is quoted and the check of the parts of a compound command does not match it. A subagent of the coordinator cannot answer a confirmation, so `eval`, `debug` and the confirmed commands are refused there.
 
 **Threads.** Start an OMP thread with `--agent omp` and pick its model with `--agent-arg --model=<provider/model>[:<level>]`, for example `--agent-arg --model=anthropic/claude-opus-4-5:high`. The prompt that starts an OMP thread contains the word workflowz, which turns on OMP's workflow notice for that turn, and the brief tells the thread to run work with several independent slices as an `eval` `workpool()`.
 

@@ -161,7 +161,7 @@ fn report(
         let label = format!("files {slug}");
         let problems = project::priming_problems(&project, &prefix);
         if problems.is_empty() {
-            check(&mut out, Some(true), &label, "AGENTS.md, CLAUDE.md link and uploads/ are in place".into());
+            check(&mut out, Some(true), &label, "AGENTS.md, CLAUDE.md link, .omp/config.yml and uploads/ are in place".into());
         } else if fix {
             match project::write_priming(&project, &prefix) {
                 Ok(()) => check(&mut out, Some(true), &label, format!("fixed: {}", problems.join("; "))),
@@ -300,28 +300,51 @@ fn report(
         }
     }
 
-    // The OMP extension, OMP's stand-in for the hooks. `--fix` rewrites an
-    // older copy of ours, and a missing one only after `configure`.
+    // The OMP extension, OMP's stand-in for the hooks. `--fix` touches it only
+    // after `configure` (journaled), and rewrites an older copy of ours only
+    // when it serves this root: one global file serves one root, and doctor
+    // at another root (a dev root) must not move it.
     if crate::setup::omp_agent_dir(env).is_dir() {
+        use crate::setup::ExtensionState;
         let file = crate::setup::omp_extension_path(env);
         let rendered = crate::setup::render_omp_extension(&crate::paths::binary().unwrap_or_default(), root);
         let journaled = journal.get(&*file.to_string_lossy()).is_some_and(|o| o.kind == "omp-extension");
         let label = "omp extension";
         let version = crate::setup::OMP_EXTENSION_VERSION;
+        let move_it = "run `configure --clients omp` from this root to move it here";
         match crate::setup::omp_extension_state(&file, &rendered) {
-            Ok(crate::setup::ExtensionState::Current) => check(&mut out, Some(true), label, format!("{} is v{version} and runs this binary", file.display())),
-            Ok(state @ (crate::setup::ExtensionState::Missing | crate::setup::ExtensionState::Stale)) if fix && (journaled || state == crate::setup::ExtensionState::Stale) => {
-                let options = crate::setup::ConfigureOptions { clients: vec!["omp".into()], claude_home: None, codex_home: None, dry_run: false, hooks: true, sidebar: false, key: None, herdr_config: None, skill: None };
-                let ctx = Ctx { env, root: root.to_path_buf(), config_dir: config_dir.to_path_buf(), runner, detached_ticker: false };
-                match crate::setup::configure(&ctx, &options) {
-                    Ok(_) => check(&mut out, Some(true), label, format!("fixed: {} is v{version} and runs this binary", file.display())),
-                    Err(error) => check(&mut out, Some(false), label, format!("could not fix: {error:#}")),
+            Ok(ExtensionState::Current) => check(&mut out, Some(true), label, format!("{} is v{version} and runs this binary", file.display())),
+            Ok(state @ (ExtensionState::Missing | ExtensionState::Stale)) => {
+                let installed_for = crate::setup::read(&file).ok().flatten().and_then(|t| crate::setup::omp_extension_root(&t));
+                let this_root = installed_for.as_deref() == Some(&*root.to_string_lossy());
+                if !journaled && state == ExtensionState::Missing {
+                    check(&mut out, None, label, format!("{} is missing; `configure --clients omp` installs it", file.display()));
+                } else if !journaled {
+                    check(&mut out, None, label, format!("{} is left over from an earlier configure; delete it, or {move_it}", file.display()));
+                } else if state == ExtensionState::Stale && !this_root {
+                    let other = installed_for.unwrap_or_else(|| "an unknown root".into());
+                    check(&mut out, None, label, format!("{} is installed for root {other}; {move_it}", file.display()));
+                } else if fix {
+                    let options = crate::setup::ConfigureOptions { clients: vec!["omp".into()], claude_home: None, codex_home: None, dry_run: false, hooks: true, sidebar: false, key: None, herdr_config: None, skill: None };
+                    let ctx = Ctx { env, root: root.to_path_buf(), config_dir: config_dir.to_path_buf(), runner, detached_ticker: false };
+                    match crate::setup::configure(&ctx, &options) {
+                        Ok(_) => check(&mut out, Some(true), label, format!("fixed: {} is v{version} and runs this binary", file.display())),
+                        Err(error) => check(&mut out, Some(false), label, format!("could not fix: {error:#}")),
+                    }
+                } else if state == ExtensionState::Missing {
+                    check(&mut out, None, label, format!("{} is missing; `doctor --fix` installs it", file.display()));
+                } else {
+                    check(&mut out, None, label, format!("{} is outdated or runs another binary; `doctor --fix` rewrites it", file.display()));
                 }
             }
-            Ok(crate::setup::ExtensionState::Missing) => check(&mut out, None, label, format!("{} is missing; {} installs it", file.display(), if journaled { "`doctor --fix`" } else { "`configure --clients omp`" })),
-            Ok(crate::setup::ExtensionState::Stale) => check(&mut out, None, label, format!("{} is outdated or runs another binary or root; `doctor --fix` rewrites it", file.display())),
-            Ok(crate::setup::ExtensionState::Foreign) => check(&mut out, None, label, format!("{} is not this plugin's file, so the extension is not installed; move it away and run `configure --clients omp`", file.display())),
+            Ok(ExtensionState::Foreign) => check(&mut out, None, label, format!("{} is not this plugin's file, so the extension is not installed; move it away and run `configure --clients omp`", file.display())),
             Err(error) => check(&mut out, None, label, format!("{error:#}")),
+        }
+        // The project `.omp/config.yml` replaces the `bash.patterns` list
+        // instead of merging it, so the user's own rules stop applying there.
+        let config = crate::setup::omp_agent_dir(env).join("config.yml");
+        if std::fs::read_to_string(&config).is_ok_and(|t| has_bash_patterns(&t)) {
+            check(&mut out, None, "omp bash.patterns", format!("your global OMP bash.patterns ({}) do not apply in OMP coordinator sessions: the project .omp/config.yml list replaces them (see docs/operations.md#omp)", config.display()));
         }
     }
 
@@ -412,6 +435,24 @@ fn report(
     (out, healthy)
 }
 
+/// Whether an OMP `config.yml` has a top-level `bash:` section with a
+/// `patterns:` key. A line scan, not a YAML parse: enough for a warning.
+fn has_bash_patterns(text: &str) -> bool {
+    let mut in_bash = false;
+    for line in text.lines() {
+        let code = line.split(" #").next().unwrap_or("").trim_end();
+        if code.trim_start().is_empty() || code.trim_start().starts_with('#') {
+            continue;
+        }
+        if !code.starts_with([' ', '\t']) {
+            in_bash = code == "bash:";
+        } else if in_bash && code.trim_start().starts_with("patterns:") {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,7 +530,7 @@ mod tests {
         assert!(project.dir().join("AGENTS.md").is_file());
         assert!(project.dir().join("uploads").is_dir());
         let (text, _) = report(&env, &root, &home.path().join("cfg"), &flags, &runner, false, None);
-        assert!(text.contains("[ok  ] files demo: AGENTS.md, CLAUDE.md link and uploads/ are in place"), "{text}");
+        assert!(text.contains("[ok  ] files demo: AGENTS.md, CLAUDE.md link, .omp/config.yml and uploads/ are in place"), "{text}");
     }
 
     #[test]
@@ -556,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn fix_rewrites_our_outdated_omp_extension_and_never_a_foreign_one() {
+    fn fix_rewrites_our_outdated_omp_extension_only_when_journaled_for_this_root() {
         let home = tempfile::tempdir().unwrap();
         let agent = home.path().join("omp-agent");
         std::fs::create_dir_all(&agent).unwrap();
@@ -566,16 +607,27 @@ mod tests {
         let cfg = home.path().join("cfg");
         let flags = SessionFlags::default();
         let file = crate::setup::omp_extension_path(&env);
-        let rendered = crate::setup::render_omp_extension(&crate::paths::binary().unwrap(), &root);
+        let binary = crate::paths::binary().unwrap();
+        let rendered = crate::setup::render_omp_extension(&binary, &root);
+        let version = crate::setup::OMP_EXTENSION_VERSION;
+        let old = rendered.replacen(&format!("OMP_VERSION={version}\n"), "OMP_VERSION=0\n", 1);
+        assert_ne!(old, rendered);
 
         // Never configured: `--fix` does not install it.
         let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, None);
         assert!(text.contains("[warn] omp extension:") && text.contains("`configure --clients omp` installs it"), "{text}");
         assert!(!file.exists());
 
-        // An older copy of ours: reported, and `--fix` rewrites it.
+        // Ours, but no longer journaled (`unconfigure` left it): never rewritten.
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        std::fs::write(&file, "// HERDR_PROJECTS_OMP_VERSION=0\nold\n").unwrap();
+        std::fs::write(&file, &old).unwrap();
+        let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, None);
+        assert!(text.contains("[warn] omp extension:") && text.contains("left over"), "{text}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), old);
+
+        // Journaled, an older copy for this root: reported, and `--fix` rewrites it.
+        let owned = crate::setup::Owned { before: None, after: "x".into(), kind: "omp-extension".into(), command: None };
+        crate::setup::save_journal(&cfg, &[(file.to_string_lossy().into_owned(), owned)].into()).unwrap();
         let (text, _) = report(&env, &root, &cfg, &flags, &runner, false, None);
         assert!(text.contains("[warn] omp extension:") && text.contains("outdated"), "{text}");
         let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, None);
@@ -583,6 +635,14 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), rendered);
         let (text, _) = report(&env, &root, &cfg, &flags, &runner, false, None);
         assert!(text.contains("[ok  ] omp extension:"), "{text}");
+
+        // Journaled, but serving another root: `--fix` never moves it.
+        let other = home.path().join("other-root");
+        let theirs = crate::setup::render_omp_extension(&binary, &other);
+        std::fs::write(&file, &theirs).unwrap();
+        let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, None);
+        assert!(text.contains(&format!("installed for root {}", other.display())) && text.contains("`configure --clients omp` from this root"), "{text}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), theirs);
 
         // Journaled and deleted by the user: `--fix` puts it back.
         std::fs::remove_file(&file).unwrap();
@@ -594,6 +654,25 @@ mod tests {
         let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, None);
         assert!(text.contains("is not this plugin's file"), "{text}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "// mine\n");
+    }
+
+    #[test]
+    fn global_omp_bash_patterns_are_flagged() {
+        assert!(has_bash_patterns("theme: dark\nbash:\n  # mine\n  patterns:\n    - match: \"rm *\"\n"));
+        assert!(has_bash_patterns("bash:  # comment\n  enabled: true\n  patterns: []\n"));
+        assert!(!has_bash_patterns("bash:\n  enabled: true\nother:\n  patterns:\n"));
+        assert!(!has_bash_patterns("# bash:\n#   patterns:\npatterns: []\n"));
+
+        let home = tempfile::tempdir().unwrap();
+        let agent = home.path().join("omp-agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        let env = Env::for_test(home.path(), &[("PI_CODING_AGENT_DIR", agent.to_str().unwrap())]);
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let root = home.path().join("root");
+        let report_text = || report(&env, &root, &home.path().join("cfg"), &SessionFlags::default(), &runner, false, None).0;
+        assert!(!report_text().contains("omp bash.patterns"));
+        std::fs::write(agent.join("config.yml"), "bash:\n  patterns:\n    - match: \"rm *\"\n      approval: deny\n").unwrap();
+        assert!(report_text().contains("[warn] omp bash.patterns: your global OMP bash.patterns"));
     }
 
     #[test]

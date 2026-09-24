@@ -494,8 +494,9 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, agent: Option<&str>, agent_args:
 }
 
 /// Sends a follow-up. The one sender that does not use the ready-for-a-prompt
-/// predicate: agents queue a message that arrives while they work.
-pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
+/// predicate: agents queue a message that arrives while they work. Returns
+/// the agent's state and how the text went out.
+pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<(String, crate::delivery::Sent)> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
     if text.trim().is_empty() {
@@ -511,12 +512,12 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     let (agents, _) = lists_for(&view, &record)?;
     let routed = crate::delivery::routed(&ctx.root, &view.socket, &record.pane_id, record.is_remote());
     let state = prompt_state(&record, &agents, routed)?;
-    crate::delivery::send(&ctx.root, &view.herdr.on_machine(&record.machine), &view.socket, &record.pane_id, record.is_remote(), "follow-up", text.trim())
+    let sent = crate::delivery::send(&ctx.root, &view.herdr.on_machine(&record.machine), &view.socket, &record.pane_id, routed, "follow-up", text.trim())
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     // Written after the send (or the queueing), so the task file never claims
     // a prompt that was refused; a restarted thread re-reads it with its task.
     thread::append_follow_up(&project, id, text)?;
-    Ok(state)
+    Ok((state, sent))
 }
 
 /// `thread next`: forward line N of the thread's Next list as a prompt, or add
@@ -550,8 +551,9 @@ pub fn next(ctx: &Ctx, slug: &str, id: &str, line: Option<usize>, add: Option<&s
         }
         Some(n) => {
             let text = lines.get(n.wrapping_sub(1)).with_context(|| format!("{id} has no Next line {n} ({} lines)", lines.len()))?;
-            let state = prompt(ctx, slug, id, text)?;
-            println!("sent Next line {n} to {id} (agent was {state}): {text}");
+            let (state, sent) = prompt(ctx, slug, id, text)?;
+            let verb = if sent == crate::delivery::Sent::Queued { "queued" } else { "sent" };
+            println!("{verb} Next line {n} to {id} (agent was {state}): {text}");
             Ok(())
         }
     }

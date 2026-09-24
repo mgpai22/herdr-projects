@@ -7,7 +7,7 @@ Install the plugin, run `configure` once, create a project, and talk to its coor
 - macOS or Linux, and [Herdr](https://herdr.dev) 0.9.1 or newer. Check with `herdr status`: both the client and the running server must be 0.9.1 or newer. After `herdr update`, a server that was already running stays on the old version until you restart it, and `herdr plugin link` or `install` then fails with `plugin_requires_newer_herdr`.
 - Only to build from source: Rust/Cargo 1.89 or newer and a C compiler. Releases carry prebuilt binaries for macOS and Linux on Apple Silicon/arm64 and Intel/x86_64, so most installs need neither. On macOS, `xcode-select --install` installs Apple's build tools. Install Rust with [rustup](https://rustup.rs).
 - Git.
-- An agent CLI Herdr can start, on `PATH`. Any of Herdr's 24 agent kinds works (`claude`, `codex`, `opencode`, `cursor`, `gemini` and more). Claude Code is the one exercised most. Progress self-reports come through hooks, which `configure` installs for Claude Code and Codex; other agents still work, with the state Herdr detects on its own.
+- An agent CLI Herdr can start, on `PATH`. Any of Herdr's 24 agent kinds works (`claude`, `codex`, `opencode`, `cursor`, `gemini` and more). Claude Code is the one exercised most. Progress self-reports come through hooks, which `configure` installs for Claude Code and Codex, and on the OMP fork through the OMP extension it installs; other agents still work, with the state Herdr detects on its own.
 - Optional: `gh`, logged in, for pull request follow-up; `ssh` and `rsync` for threads on other machines.
 
 The plugin needs no hosted service and no API key. It depends on Herdr and nothing else, no other plugin included.

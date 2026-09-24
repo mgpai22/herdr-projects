@@ -98,6 +98,12 @@ impl<'a> Herdr<'a> {
         }
     }
 
+    /// True when calls are forwarded to a saved machine: its pane ids are
+    /// another server's.
+    pub fn remote(&self) -> bool {
+        self.machine.is_some()
+    }
+
     /// `HERDR_SESSION` is removed so an inherited value can never compete with
     /// the socket this project recorded.
     pub fn cmd(&self, timeout: Duration) -> Cmd {
@@ -123,8 +129,9 @@ impl<'a> Herdr<'a> {
 }
 
 /// A herdr call that failed. `code` is herdr's own error code (for example
-/// `agent_blocked` or `pane_not_found`), or `timeout` / `unreachable` / `failed`
-/// when herdr never answered with one.
+/// `agent_blocked`, or `agent_not_found` from `agent prompt` for a pane that
+/// is gone or runs no agent), or `timeout` / `unreachable` / `failed` when
+/// herdr never answered with one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HerdrError {
     pub code: String,

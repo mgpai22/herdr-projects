@@ -544,8 +544,9 @@ pub fn run() -> Result<()> {
             ThreadCommand::Stop { slug, id } => threads::stop(&ctx, &slug, &id),
             ThreadCommand::Prompt { slug, id, text_file } => {
                 let text = read_text(&text_file)?;
-                let state = threads::prompt(&ctx, &slug, &id, &text)?;
-                println!("sent to {id} (agent was {state})");
+                let (state, sent) = threads::prompt(&ctx, &slug, &id, &text)?;
+                let how = if sent == crate::delivery::Sent::Queued { "queued for" } else { "sent to" };
+                println!("{how} {id} (agent was {state})");
                 Ok(())
             }
             ThreadCommand::Adopt { slug, pane, title, task_file } => {

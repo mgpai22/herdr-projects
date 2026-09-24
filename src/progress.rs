@@ -158,12 +158,15 @@ pub fn clean(input: &str, columns: usize) -> String {
 
 /// The calling pane, when this process runs inside a Herdr pane: the id
 /// Herdr shows for it (a moved pane keeps its launch-time `HERDR_PANE_ID`),
-/// its terminal id and the agent Herdr detects. `None` outside Herdr.
+/// its terminal id, the agent Herdr detects and its working directories
+/// (empty when herdr does not report them). `None` outside Herdr.
 pub struct Current {
     pub socket: String,
     pub pane_id: String,
     pub terminal_id: String,
     pub agent: String,
+    pub cwd: String,
+    pub foreground_cwd: String,
 }
 
 pub fn current(env: &Env, runner: &dyn Runner) -> Option<Current> {
@@ -186,6 +189,8 @@ pub fn current_within(env: &Env, runner: &dyn Runner, timeout: std::time::Durati
         pane_id,
         terminal_id: pane["terminal_id"].as_str().unwrap_or("").to_string(),
         agent: pane["agent"].as_str().unwrap_or("").to_string(),
+        cwd: pane["cwd"].as_str().unwrap_or("").to_string(),
+        foreground_cwd: pane["foreground_cwd"].as_str().unwrap_or("").to_string(),
     })
 }
 
@@ -286,9 +291,12 @@ pub fn respond(record: &mut Record, kind: &str, prefix: &str, now: i64) -> Optio
     match kind {
         "SessionStart" => {
             // A new session in this pane: the old report no longer describes it.
-            // The channel stays: it belongs to the extension, not the session.
+            // An OMP session keeps the channel: it belongs to the extension, not
+            // the session. Any other harness starting in the pane ends it, or
+            // its prompts would wait for an extension that is not there.
             let old = std::mem::take(record);
-            *record = Record { socket: old.socket, pane_id: old.pane_id, terminal_id: old.terminal_id, agent: old.agent, channel: old.channel, channel_seen: old.channel_seen, session_started_at: now, reminded_at: now, ..Record::default() };
+            let (channel, channel_seen) = if old.agent == "omp" { (old.channel, old.channel_seen) } else { Default::default() };
+            *record = Record { socket: old.socket, pane_id: old.pane_id, terminal_id: old.terminal_id, agent: old.agent, channel, channel_seen, session_started_at: now, reminded_at: now, ..Record::default() };
             Some(instructions(prefix, &record.pane_id))
         }
         "UserPromptSubmit" => {
@@ -420,7 +428,7 @@ mod tests {
 
     #[test]
     fn session_start_injects_instructions_and_resets_the_record() {
-        let mut record = Record { pane_id: "w1:p1".into(), activity: "Old".into(), percent: Some(50), reported_at: 5, channel: CHANNEL_OMP.into(), channel_seen: 990, ..Record::default() };
+        let mut record = Record { pane_id: "w1:p1".into(), agent: "omp".into(), activity: "Old".into(), percent: Some(50), reported_at: 5, channel: CHANNEL_OMP.into(), channel_seen: 990, ..Record::default() };
         let text = respond(&mut record, "SessionStart", "/p/hp --root /r", 1000).unwrap();
         assert!(text.contains("/p/hp --root /r report --percent 25"));
         assert!(text.contains("(w1:p1)"));
@@ -428,7 +436,13 @@ mod tests {
         assert_eq!(record.percent, None);
         assert_eq!(record.reported_at, 0);
         assert_eq!(record.session_started_at, 1000);
-        assert_eq!((record.channel.as_str(), record.channel_seen), (CHANNEL_OMP, 990), "a new session keeps the extension's channel");
+        assert_eq!((record.channel.as_str(), record.channel_seen), (CHANNEL_OMP, 990), "a new OMP session keeps the extension's channel");
+
+        // Another harness started in the pane the extension pulled from: its
+        // prompts must not wait for an extension that is gone.
+        let mut claude = Record { pane_id: "w1:p1".into(), agent: "claude".into(), channel: CHANNEL_OMP.into(), channel_seen: 990, ..Record::default() };
+        respond(&mut claude, "SessionStart", "hp", 1000);
+        assert_eq!((claude.channel.as_str(), claude.channel_seen), ("", 0));
     }
 
     #[test]

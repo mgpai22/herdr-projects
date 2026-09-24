@@ -2024,11 +2024,34 @@ fn a_follow_up_to_a_blocked_agent_is_queued_only_while_its_omp_extension_pulls()
     assert!(!task().contains("Also this."));
 
     heartbeat(&world, &socket, "w2:p1", 0);
-    assert_eq!(threads::prompt(&ctx, "demo", "t-0001", "Also this.").unwrap(), "blocked");
+    assert_eq!(threads::prompt(&ctx, "demo", "t-0001", "Also this.").unwrap(), ("blocked".to_string(), crate::delivery::Sent::Queued));
     assert_eq!(world.runner.count("agent prompt"), 0);
     let queued = crate::delivery::pending(&world.root, &socket, "w2:p1");
     assert_eq!((queued.len(), queued[0].kind.as_str(), queued[0].text.as_str()), (1, "follow-up", "Also this."));
     assert!(task().ends_with("Also this.\n"));
+}
+
+#[test]
+fn a_coordinator_prompt_prefers_a_free_coordinator_over_a_blocked_one_that_pulls() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let socket = project.coordinator().unwrap().socket;
+    let dir = project.canonical_dir().to_string_lossy().into_owned();
+    let coordinator = |pane: &str, state: &str, seq: u64| format!(r#"{{"pane_id":"{pane}","tab_id":"w1:t1","workspace_id":"w1","cwd":"{dir}","agent":"omp","agent_status":"{state}","state_change_seq":{seq}}}"#);
+    // The blocked one changed state last and its extension pulls.
+    *world.agents.borrow_mut() = format!("[{},{}]", coordinator("w1:p1", "idle", 1), coordinator("w1:p2", "blocked", 5));
+    heartbeat(&world, &socket, "w1:p2", 0);
+    world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+    let ctx = world.ctx();
+    coordinator::prompt(&ctx, "demo", "Add a task.").unwrap();
+    assert_eq!(world.runner.count("agent prompt w1:p1"), 1);
+    assert!(crate::delivery::pending(&world.root, &socket, "w1:p2").is_empty());
+
+    // With no free one, the text waits behind the blocked one's question.
+    *world.agents.borrow_mut() = format!("[{}]", coordinator("w1:p2", "blocked", 5));
+    coordinator::prompt(&ctx, "demo", "Add another.").unwrap();
+    assert_eq!(world.runner.count("agent prompt"), 1);
+    assert_eq!(crate::delivery::pending(&world.root, &socket, "w1:p2").len(), 1);
 }
 
 #[test]

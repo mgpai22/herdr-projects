@@ -195,9 +195,14 @@ pub fn hook_file(env: &Env, agent: &str, claude_home: Option<&Path>, codex_home:
 }
 
 /// OMP's agent directory: `PI_CODING_AGENT_DIR`, else `~/.omp/agent`. Named
-/// profiles (`~/.omp/profiles/<name>/agent`) are not supported.
+/// profiles (`~/.omp/profiles/<name>/agent`) are not supported. A relative
+/// value is resolved against the cwd, as OMP does, so the journal key names
+/// the file that was written, whatever the cwd of a later `unconfigure`.
 pub fn omp_agent_dir(env: &Env) -> PathBuf {
-    env.var("PI_CODING_AGENT_DIR").map(PathBuf::from).unwrap_or_else(|| env.home.join(".omp/agent"))
+    match env.var("PI_CODING_AGENT_DIR") {
+        Some(dir) => std::path::absolute(dir).unwrap_or_else(|_| PathBuf::from(dir)),
+        None => env.home.join(".omp/agent"),
+    }
 }
 
 /// Whether a harness is installed: its config directory exists.
@@ -248,6 +253,12 @@ pub fn omp_extension_state(path: &Path, rendered: &str) -> Result<ExtensionState
         Some(text) if text.starts_with(OMP_HEADER) => ExtensionState::Stale,
         Some(_) => ExtensionState::Foreign,
     })
+}
+
+/// The root a copy of ours was rendered for: its `const ROOT = "…";` line.
+pub fn omp_extension_root(text: &str) -> Option<String> {
+    let literal = text.lines().find_map(|l| l.strip_prefix("const ROOT = ")?.strip_suffix(';'))?;
+    serde_json::from_str(literal).ok()
 }
 
 /// Whether OMP already loads the bundled skill through `~/.agents/skills`
@@ -842,6 +853,21 @@ mod tests {
         assert!(notes.iter().any(|n| n.contains("left alone")), "{notes:?}");
         assert!(file.exists());
         assert!(load_journal(&ctx.config_dir).is_empty());
+    }
+
+    #[test]
+    fn a_relative_omp_agent_dir_resolves_against_the_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[("PI_CODING_AGENT_DIR", "omp-agent")]);
+        assert_eq!(omp_agent_dir(&env), std::env::current_dir().unwrap().join("omp-agent"));
+    }
+
+    #[test]
+    fn the_root_a_copy_was_rendered_for_is_read_back() {
+        let root = Path::new("/r/with \"quote\"");
+        let rendered = render_omp_extension(Path::new("/bin/hp"), root);
+        assert_eq!(omp_extension_root(&rendered).as_deref(), Some(root.to_str().unwrap()));
+        assert_eq!(omp_extension_root("// HERDR_PROJECTS_OMP_VERSION=0\nold\n"), None);
     }
 
     #[test]

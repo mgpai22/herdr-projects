@@ -95,7 +95,7 @@ This fork (branch `omp`) adds [OMP](https://github.com/can1357/oh-my-pi) as a co
 
 - `configure` installs an OMP extension in `~/.omp/agent/extensions/` (or under `$PI_CODING_AGENT_DIR`) and links the `autoproject` skill. Named OMP profiles are not supported.
 - The extension gives OMP the same progress instructions as the Claude Code and Codex hooks, reports progress from the agent's todo list, and takes the binary's prompts through a file queue instead of typed keystrokes, so a prompt never merges with half-typed text.
-- Each project folder gets `.omp/config.yml`: an OMP coordinator can never run `routine approve`, `configure` or `unconfigure`, and `thread resolve`, `sweep`, `archive`, `delete` and every `eval` call wait for you to confirm, also under `approvalMode: yolo`.
+- Each project folder gets `.omp/config.yml`: an OMP coordinator can never run `routine approve`, `configure` or `unconfigure`, and `thread resolve`, `sweep`, `archive`, `delete` and every `eval` or `debug` call wait for you to confirm, also under `approvalMode: yolo`. Its rules replace your global OMP `bash.patterns` in the coordinator's session.
 - Pick a thread's model with `--agent omp --agent-arg --model=<provider/model>:<level>`.
 
 [Operations](docs/operations.md#omp) has the details.

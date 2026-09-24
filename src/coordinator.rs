@@ -484,16 +484,17 @@ pub fn prompt(ctx: &Ctx, slug: &str, text: &str) -> Result<()> {
     }
     let view = crate::threads::session_view(ctx, &project).with_context(|| format!("the herdr session of `{slug}` is not reachable; run `open {slug}` first"))?;
     let record = project.coordinator().unwrap_or_default();
-    let target = view
+    let (target, routed) = view
         .agents
         .iter()
         .filter(|a| is_coordinator(&record, a))
+        .map(|a| (a, crate::delivery::routed(&ctx.root, &view.socket, &a.pane_id, false)))
         // A blocked coordinator takes the text only when the OMP extension
-        // queues it behind the question.
-        .filter(|a| a.agent_status != "unknown" && (a.agent_status != "blocked" || crate::delivery::routed(&ctx.root, &view.socket, &a.pane_id, false)))
-        .max_by_key(|a| a.state_change_seq)
+        // queues it behind the question, and only when none is free.
+        .filter(|(a, routed)| a.agent_status != "unknown" && (a.agent_status != "blocked" || *routed))
+        .max_by_key(|(a, _)| (a.agent_status != "blocked", a.state_change_seq))
         .with_context(|| format!("no coordinator of `{slug}` can take a prompt right now; `open {slug}` starts one"))?;
-    let sent = crate::delivery::send(&ctx.root, &view.herdr, &view.socket, &target.pane_id, false, "coordinator", text).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let sent = crate::delivery::send(&ctx.root, &view.herdr, &view.socket, &target.pane_id, routed, "coordinator", text).map_err(|e| anyhow::anyhow!("{e}"))?;
     let how = if sent == crate::delivery::Sent::Queued { "queued for" } else { "sent to" };
     println!("{how} the coordinator in pane {} (agent was {})", target.pane_id, target.agent_status);
     Ok(())

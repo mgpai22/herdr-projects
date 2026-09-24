@@ -256,7 +256,8 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
         // `agent_blocked` and other errors are returned, logged by the caller,
         // and the nudge is retried on a later tick. Queued for the OMP
         // extension counts as announced.
-        crate::delivery::send(&project.root, herdr, socket, pane, false, "nudge", NUDGE_TEXT)?;
+        let routed = crate::delivery::routed(&project.root, socket, pane, false);
+        crate::delivery::send(&project.root, herdr, socket, pane, routed, "nudge", NUDGE_TEXT)?;
     }
     state.nudged = hash;
     Ok(())
@@ -441,7 +442,7 @@ fn fire_pr_routines(ctx: &Ctx, project: &Project, t: &Thread, url: &str, events:
         }
         let prompt = pr_routine_prompt(&r.name, &r.prompt, url, &hit, summary);
         let outcome = match threads::prompt(ctx, &project.slug, &t.id, &prompt) {
-            Ok(state) => format!("prompted {} (agent was {state}) about: {}", t.id, hit.join(", ")),
+            Ok((state, _)) => format!("prompted {} (agent was {state}) about: {}", t.id, hit.join(", ")),
             Err(error) => format!("could not prompt {} about {}: {error:#}", t.id, hit.join(", ")),
         };
         errors.extend(inbox::write(project, "routine", &r.name, &format!("routine `{}` {outcome}", r.name), "").err());
