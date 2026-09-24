@@ -15,7 +15,7 @@ const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Prints the report and returns whether every required check passed. With
 /// `fix`, repairs what the binary owns: priming files, `uploads/`, the
-/// absolute binary path they carry, and the skill link for a configured harness. Never edits another plugin's entries.
+/// absolute binary path they carry, the OMP extension, and the skill link for a configured harness. Never edits another plugin's entries.
 pub fn run(ctx: &Ctx, session: &SessionFlags, fix: bool) -> Result<bool> {
     let skill = crate::setup::skill_source();
     let (text, healthy) = report(ctx.env, &ctx.root, &ctx.config_dir, session, ctx.runner, fix, skill.as_deref());
@@ -300,19 +300,53 @@ fn report(
         }
     }
 
+    // The OMP extension, OMP's stand-in for the hooks. `--fix` rewrites an
+    // older copy of ours, and a missing one only after `configure`.
+    if crate::setup::omp_agent_dir(env).is_dir() {
+        let file = crate::setup::omp_extension_path(env);
+        let rendered = crate::setup::render_omp_extension(&crate::paths::binary().unwrap_or_default(), root);
+        let journaled = journal.get(&*file.to_string_lossy()).is_some_and(|o| o.kind == "omp-extension");
+        let label = "omp extension";
+        let version = crate::setup::OMP_EXTENSION_VERSION;
+        match crate::setup::omp_extension_state(&file, &rendered) {
+            Ok(crate::setup::ExtensionState::Current) => check(&mut out, Some(true), label, format!("{} is v{version} and runs this binary", file.display())),
+            Ok(state @ (crate::setup::ExtensionState::Missing | crate::setup::ExtensionState::Stale)) if fix && (journaled || state == crate::setup::ExtensionState::Stale) => {
+                let options = crate::setup::ConfigureOptions { clients: vec!["omp".into()], claude_home: None, codex_home: None, dry_run: false, hooks: true, sidebar: false, key: None, herdr_config: None, skill: None };
+                let ctx = Ctx { env, root: root.to_path_buf(), config_dir: config_dir.to_path_buf(), runner, detached_ticker: false };
+                match crate::setup::configure(&ctx, &options) {
+                    Ok(_) => check(&mut out, Some(true), label, format!("fixed: {} is v{version} and runs this binary", file.display())),
+                    Err(error) => check(&mut out, Some(false), label, format!("could not fix: {error:#}")),
+                }
+            }
+            Ok(crate::setup::ExtensionState::Missing) => check(&mut out, None, label, format!("{} is missing; {} installs it", file.display(), if journaled { "`doctor --fix`" } else { "`configure --clients omp`" })),
+            Ok(crate::setup::ExtensionState::Stale) => check(&mut out, None, label, format!("{} is outdated or runs another binary or root; `doctor --fix` rewrites it", file.display())),
+            Ok(crate::setup::ExtensionState::Foreign) => check(&mut out, None, label, format!("{} is not this plugin's file, so the extension is not installed; move it away and run `configure --clients omp`", file.display())),
+            Err(error) => check(&mut out, None, label, format!("{error:#}")),
+        }
+    }
+
     // The bundled skill, linked where each installed harness looks for skills.
     // `--fix` links it only for a harness the user already ran `configure`
     // for (its hooks or the link are journaled), so `update` alone brings a
     // newly bundled skill to existing users without a new opt-in.
     if let Some(source) = skill.map(Path::to_path_buf).filter(|s| s.join("SKILL.md").is_file()) {
-        for agent in ["claude", "codex"] {
-            if !crate::setup::hook_file(env, agent, None, None).parent().is_some_and(Path::is_dir) {
+        for agent in ["claude", "codex", "omp"] {
+            if !crate::setup::installed(env, agent, None, None) {
                 continue;
             }
             let link = crate::setup::skill_link(env, agent, None);
             let label = format!("skill {agent}");
+            if agent == "omp" && crate::setup::omp_sees_shared_skill(env, &source) {
+                check(&mut out, Some(true), &label, format!("OMP loads the bundled `{}` skill through ~/.agents/skills", crate::setup::SKILL));
+                continue;
+            }
             let journaled = journal.contains_key(&*link.to_string_lossy());
-            let opted_in = journaled || journal.get(&*crate::setup::hook_file(env, agent, None, None).to_string_lossy()).is_some_and(|o| o.kind == "hooks");
+            // What `configure` installed for the harness besides the skill.
+            let (setup_file, setup_kind) = match agent {
+                "omp" => (crate::setup::omp_extension_path(env), "omp-extension"),
+                _ => (crate::setup::hook_file(env, agent, None, None), "hooks"),
+            };
+            let opted_in = journaled || journal.get(&*setup_file.to_string_lossy()).is_some_and(|o| o.kind == setup_kind);
             let state = crate::setup::skill_state(&link, &source);
             let repairable = matches!(state, crate::setup::SkillState::Missing) || matches!(state, crate::setup::SkillState::Elsewhere(_) if journaled);
             if fix && opted_in && repairable {
@@ -519,6 +553,78 @@ mod tests {
         let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, Some(&moved));
         assert!(text.contains("is not this plugin's link"), "{text}");
         assert_eq!(crate::setup::skill_state(&link, &moved), crate::setup::SkillState::Foreign);
+    }
+
+    #[test]
+    fn fix_rewrites_our_outdated_omp_extension_and_never_a_foreign_one() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = home.path().join("omp-agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        let env = Env::for_test(home.path(), &[("PI_CODING_AGENT_DIR", agent.to_str().unwrap())]);
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let root = home.path().join("root");
+        let cfg = home.path().join("cfg");
+        let flags = SessionFlags::default();
+        let file = crate::setup::omp_extension_path(&env);
+        let rendered = crate::setup::render_omp_extension(&crate::paths::binary().unwrap(), &root);
+
+        // Never configured: `--fix` does not install it.
+        let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, None);
+        assert!(text.contains("[warn] omp extension:") && text.contains("`configure --clients omp` installs it"), "{text}");
+        assert!(!file.exists());
+
+        // An older copy of ours: reported, and `--fix` rewrites it.
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "// HERDR_PROJECTS_OMP_VERSION=0\nold\n").unwrap();
+        let (text, _) = report(&env, &root, &cfg, &flags, &runner, false, None);
+        assert!(text.contains("[warn] omp extension:") && text.contains("outdated"), "{text}");
+        let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, None);
+        assert!(text.contains("[ok  ] omp extension: fixed:"), "{text}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), rendered);
+        let (text, _) = report(&env, &root, &cfg, &flags, &runner, false, None);
+        assert!(text.contains("[ok  ] omp extension:"), "{text}");
+
+        // Journaled and deleted by the user: `--fix` puts it back.
+        std::fs::remove_file(&file).unwrap();
+        report(&env, &root, &cfg, &flags, &runner, true, None);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), rendered);
+
+        // Someone else's file of that name is never touched.
+        std::fs::write(&file, "// mine\n").unwrap();
+        let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, None);
+        assert!(text.contains("is not this plugin's file"), "{text}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "// mine\n");
+    }
+
+    #[test]
+    fn the_omp_skill_counts_as_installed_through_agents_skills() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = home.path().join("omp-agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        let env = Env::for_test(home.path(), &[("PI_CODING_AGENT_DIR", agent.to_str().unwrap())]);
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let root = home.path().join("root");
+        let cfg = home.path().join("cfg");
+        let flags = SessionFlags::default();
+        let source = home.path().join("plugin/skill/autoproject");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("SKILL.md"), "---\nname: autoproject\n---\n").unwrap();
+        let omp_link = crate::setup::skill_link(&env, "omp", None);
+        // Opted in: the extension is journaled.
+        let extension = crate::setup::Owned { before: None, after: "x".into(), kind: "omp-extension".into(), command: None };
+        crate::setup::save_journal(&cfg, &[(crate::setup::omp_extension_path(&env).to_string_lossy().into_owned(), extension)].into()).unwrap();
+
+        std::fs::create_dir_all(home.path().join(".agents/skills")).unwrap();
+        std::os::unix::fs::symlink(&source, home.path().join(".agents/skills").join(crate::setup::SKILL)).unwrap();
+        let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, Some(&source));
+        assert!(text.contains("[ok  ] skill omp: OMP loads the bundled"), "{text}");
+        assert_eq!(crate::setup::skill_state(&omp_link, &source), crate::setup::SkillState::Missing);
+
+        // Without the shared link, `--fix` links it into OMP's own skills dir.
+        std::fs::remove_file(home.path().join(".agents/skills").join(crate::setup::SKILL)).unwrap();
+        let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, Some(&source));
+        assert!(text.contains("[ok  ] skill omp: fixed:"), "{text}");
+        assert_eq!(crate::setup::skill_state(&omp_link, &source), crate::setup::SkillState::Ours);
     }
 
     #[test]

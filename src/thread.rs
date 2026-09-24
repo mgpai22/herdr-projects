@@ -282,9 +282,12 @@ pub fn thread_dir(cwd: &str, slug: &str, id: &str) -> String {
 }
 
 /// The one line the agent is prompted with; the relative path is the same for
-/// every kind. Nothing from outside is ever placed in a prompt.
-pub fn launch_prompt(slug: &str, id: &str) -> String {
-    format!("Read .herdr-project/{slug}-{id}/brief.md and do what it says.")
+/// every kind. Nothing from outside is ever placed in a prompt. OMP turns on
+/// its workflow notice only for the bare word in a user prompt (not in the
+/// brief file, not in backticks), so an OMP thread gets it here.
+pub fn launch_prompt(slug: &str, id: &str, agent: &str) -> String {
+    let workflow = if agent == "omp" { " Use workflowz for multi-slice work." } else { "" };
+    format!("Read .herdr-project/{slug}-{id}/brief.md and do what it says.{workflow}")
 }
 
 // ---------------------------------------------------------------- briefs
@@ -372,7 +375,7 @@ pub fn compose_brief(input: &BriefInput) -> String {
     if input.report_prefix.is_empty() {
         brief.push_str("Report progress with `herdr-projects report --percent N --activity '...'` if that command exists on this machine (use `--activity 'Waiting for you'` before asking the user something, and `--percent 100` when done); otherwise skip it.\n");
     } else {
-        brief.push_str(&format!("Report progress in this pane with `{} report --percent N --activity '...'` (two to four words; `--unknown` while the scope is unclear): at the start, at milestones, about once a minute while working, `--activity 'Waiting for you'` before asking the user something, and `--percent 100` when the whole task is done.\n", input.report_prefix));
+        brief.push_str(&format!("Report progress in this pane with `{} report --percent N --activity '...'` (two to four words; `--unknown` while the scope is unclear): at the start, at milestones, about once a minute while working, `--activity 'Waiting for you'` before asking the user something, and `--percent 100` when the whole task is done. If you keep a todo list, your harness may report progress from it automatically; `report` still wins for anything the list does not show.\n", input.report_prefix));
     }
     brief.push_str("\n# Task\n\n");
     brief.push_str(input.task.trim());
@@ -1091,7 +1094,11 @@ mod tests {
         assert_eq!(branch_name("demo", "t-0001", "Fix the $(login) bug!"), "hp/demo/t-0001-fix-the-login-bug");
         assert_eq!(branch_name("demo", "t-0002", "???"), "hp/demo/t-0002");
         assert_eq!(thread_dir("/wt/", "demo", "t-0001"), "/wt/.herdr-project/demo-t-0001");
-        assert_eq!(launch_prompt("demo", "t-0001"), "Read .herdr-project/demo-t-0001/brief.md and do what it says.");
+        assert_eq!(launch_prompt("demo", "t-0001", "claude"), "Read .herdr-project/demo-t-0001/brief.md and do what it says.");
+        let omp = launch_prompt("demo", "t-0001", "omp");
+        assert!(omp.starts_with("Read .herdr-project/demo-t-0001/brief.md and do what it says. "), "{omp}");
+        // OMP's keyword needs the bare word as prose: no backticks around it.
+        assert!(omp.split_whitespace().any(|w| w == "workflowz") && !omp.contains('`'), "{omp}");
     }
 
     #[test]

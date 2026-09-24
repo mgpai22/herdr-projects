@@ -20,6 +20,8 @@ herdr plugin install eliasstravik/herdr-projects
 
 Review the install preview. Herdr clones the repository, runs `scripts/install.sh`, and registers the plugin. The script downloads the release's prebuilt binary for your machine and checks it against the release's `SHA256SUMS`. When there is no such binary, the download fails or the checksum does not match, it says so and runs the locked Cargo release build instead. Set `HERDR_PROJECTS_BUILD=source` to always build from source. A checkout with local changes, or on a commit after the release, also builds from source. Its startup command starts a background ticker only when you have at least one project.
 
+For the OMP fork (branch `omp`), follow [Operations: OMP](operations.md#omp) instead: it has no release binaries and installs from a linked checkout.
+
 To run the binary from a terminal, link it onto your `PATH`. `herdr plugin list` prints the plugin's folder:
 
 ```bash
@@ -34,11 +36,12 @@ herdr-projects configure --dry-run   # shows what it would change
 herdr-projects configure
 ```
 
-Or run `herdr plugin action invoke configure --plugin herdr-projects`. It changes four things and records each change, so `herdr-projects unconfigure` removes exactly what it added:
+Or run `herdr plugin action invoke configure --plugin herdr-projects`. It changes these things and records each change, so `herdr-projects unconfigure` removes exactly what it added:
 
 - **Your Herdr config** (`~/.config/herdr/config.toml`). Two agent rows (`$hp_state`, the state line; `$hp_activity`, what the agent says it is doing), one Space row (`$hp`, the project count), the popup key `prefix+a` and a tab-bar entry `projects: N need you`. Herdr checks the result with `herdr config check` before anything is written. Pick another key with `configure --key prefix+y`; a key Herdr or you already use is refused.
 - **Claude Code hooks** in `~/.claude/settings.json` and **Codex hooks** in `~/.codex/hooks.json`. They tell an agent running in a Herdr pane how to report its progress, and remind it about once a minute. Outside Herdr they do nothing. Existing hooks and comments are kept.
-- **The `autoproject` skill**, linked from the plugin's `skill/autoproject` into `~/.claude/skills` and Codex's `~/.agents/skills`. A coordinator loads it with `/autoproject` to run an independently reviewed improvement loop. A skill of that name that is not the plugin's link is left alone, and `doctor` names it. If you configured before the skill shipped, `update` links it for you.
+- **The OMP extension** in `~/.omp/agent/extensions/herdr-projects.ts` (or under `$PI_CODING_AGENT_DIR`), on the OMP fork only. It does for OMP what the hooks do, reports progress from the agent's todo list, and takes the binary's prompts from a queue. [Operations: OMP](operations.md#omp) says what it does.
+- **The `autoproject` skill**, linked from the plugin's `skill/autoproject` into `~/.claude/skills`, Codex's `~/.agents/skills` and, on the OMP fork, `~/.omp/agent/skills` (skipped when `~/.agents/skills` already links it). A coordinator loads it with `/autoproject` to run an independently reviewed improvement loop. A skill of that name that is not the plugin's link is left alone, and `doctor` names it. If you configured before the skill shipped, `update` links it for you.
 
 Configure reloads the Herdr server's config. The sidebar rows are drawn by your client: if they don't show yet, run **reload config** in Herdr (`prefix+shift+r`).
 

@@ -306,6 +306,13 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
             Err(error) => log.line(&format!("{slug}: {error:#}")),
         }
     }
+    // Channel items no extension took go out as keystrokes, once per session.
+    let now_ms = jiff::Timestamp::now().as_millisecond();
+    for (socket, lists) in &sessions.lists {
+        if lists.is_some() {
+            crate::delivery::fallback(&ctx.root, &Herdr::new(ctx.env.herdr_bin(), socket, ctx.runner), socket, now_ms);
+        }
+    }
     for (project, seen) in &reachable {
         for error in tick_slow(ctx, project, seen, memory) {
             log.line(&format!("{}: {error:#}", project.slug));
@@ -525,8 +532,10 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
 
         let mut delivered = false;
         if t.prompt_pending && live.agent_state.as_deref().is_some_and(crate::herdr::ready_state) {
-            match herdr.agent_prompt(&t.pane_id, &thread::launch_prompt(slug, &t.id)) {
-                Ok(()) => delivered = true,
+            // Queued for the OMP extension counts as delivered: it hands the
+            // brief over itself, or the fallback types it.
+            match crate::delivery::send(&project.root, herdr, socket, &t.pane_id, t.is_remote(), "brief", &thread::launch_prompt(slug, &t.id, &t.agent)) {
+                Ok(_) => delivered = true,
                 Err(error) => pass.error = pass.error.or(Some(anyhow::anyhow!("{}: brief prompt: {error}", t.id))),
             }
         }
@@ -704,7 +713,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
         let before = state.nudged.clone();
         let target = coordinator::nudge_target(&coordinators, jiff::Timestamp::now());
         let ready_pane = target.map(|c| c.pane_id.as_str());
-        if let Err(error) = steps::nudge(project, &mut state, &settings, &herdr, ready_pane) {
+        if let Err(error) = steps::nudge(project, &mut state, &settings, &herdr, &record.socket, ready_pane) {
             first_error = first_error.or(Some(error.context("nudge")));
         }
         if state.nudged != before {

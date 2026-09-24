@@ -235,7 +235,7 @@ fn hash_ids(ids: &BTreeSet<String>) -> String {
 /// of a prompt in the coordinator; with no live coordinator the same.
 /// `coordinator_ready` is the pane of a coordinator idle long enough to be
 /// prompted (see `coordinator::nudge_target`).
-pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &Herdr, coordinator_ready: Option<&str>) -> Result<()> {
+pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &Herdr, socket: &str, coordinator_ready: Option<&str>) -> Result<()> {
     let seen = inbox::seen(project);
     let unseen: BTreeSet<String> = inbox::unhandled(project).into_iter().map(|i| i.id).filter(|id| !seen.contains(id)).collect();
     if unseen.is_empty() {
@@ -254,8 +254,9 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
             return Ok(()); // not idle long enough: try again on a later tick
         };
         // `agent_blocked` and other errors are returned, logged by the caller,
-        // and the nudge is retried on a later tick.
-        herdr.agent_prompt(pane, NUDGE_TEXT)?;
+        // and the nudge is retried on a later tick. Queued for the OMP
+        // extension counts as announced.
+        crate::delivery::send(&project.root, herdr, socket, pane, false, "nudge", NUDGE_TEXT)?;
     }
     state.nudged = hash;
     Ok(())

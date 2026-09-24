@@ -89,6 +89,17 @@ herdr-projects update --check   # only print the installed and the newest versio
 
 `update` works for both install types and changes nothing when you're already on the newest release. Its `doctor --fix` also links the `autoproject` skill for each harness you configured, so existing users don't need to run `configure` again. A linked checkout must be on `main` with no uncommitted changes, or `update` stops and says why. When the install fails, the old version stays installed and the ticker is restarted. `doctor` says when a newer version is out.
 
+## OMP fork
+
+This fork (branch `omp`) adds [OMP](https://github.com/can1357/oh-my-pi) as a coordinator and thread harness. It has no release binaries: clone it, `herdr plugin link` the checkout, run `HERDR_PROJECTS_BUILD=source sh scripts/install.sh` in it, then `herdr-projects configure --clients omp`. `update` refuses on a fork build; update with `git pull` and the same install command.
+
+- `configure` installs an OMP extension in `~/.omp/agent/extensions/` (or under `$PI_CODING_AGENT_DIR`) and links the `autoproject` skill. Named OMP profiles are not supported.
+- The extension gives OMP the same progress instructions as the Claude Code and Codex hooks, reports progress from the agent's todo list, and takes the binary's prompts through a file queue instead of typed keystrokes, so a prompt never merges with half-typed text.
+- Each project folder gets `.omp/config.yml`: an OMP coordinator can never run `routine approve`, `configure` or `unconfigure`, and `thread resolve`, `sweep`, `archive`, `delete` and every `eval` call wait for you to confirm, also under `approvalMode: yolo`.
+- Pick a thread's model with `--agent omp --agent-arg --model=<provider/model>:<level>`.
+
+[Operations](docs/operations.md#omp) has the details.
+
 ## Get your questions answered
 
 ### Do I need to know how to code?

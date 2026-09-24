@@ -509,13 +509,12 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     }
     let view = require_session(ctx, &project)?;
     let (agents, _) = lists_for(&view, &record)?;
-    let state = prompt_state(&record, &agents)?;
-    view.herdr
-        .on_machine(&record.machine)
-        .agent_prompt(&record.pane_id, text.trim())
+    let routed = crate::delivery::routed(&ctx.root, &view.socket, &record.pane_id, record.is_remote());
+    let state = prompt_state(&record, &agents, routed)?;
+    crate::delivery::send(&ctx.root, &view.herdr.on_machine(&record.machine), &view.socket, &record.pane_id, record.is_remote(), "follow-up", text.trim())
         .map_err(|error| anyhow::anyhow!("{error}"))?;
-    // Written after the send, so the task file never claims a prompt that was
-    // refused; a restarted thread re-reads it with its task.
+    // Written after the send (or the queueing), so the task file never claims
+    // a prompt that was refused; a restarted thread re-reads it with its task.
     thread::append_follow_up(&project, id, text)?;
     Ok(state)
 }
@@ -574,14 +573,16 @@ pub fn stop(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// The state a follow-up may be sent in, or the refusal.
-pub fn prompt_state(record: &Thread, agents: &[Agent]) -> Result<String> {
+/// The state a follow-up may be sent in, or the refusal. A blocked agent
+/// takes one only when it is `routed` to the OMP extension, which queues it
+/// behind the question without touching the input box.
+pub fn prompt_state(record: &Thread, agents: &[Agent], routed: bool) -> Result<String> {
     let agent = agents
         .iter()
         .find(|a| thread::agent_matches(record, a))
         .with_context(|| format!("no agent is detected in {}'s pane; text is never typed at a bare shell prompt (try `thread restart`)", record.id))?;
     match agent.agent_status.as_str() {
-        "blocked" => bail!("agent_blocked: {} is waiting on the user in its pane ({})", record.id, record.pane_id),
+        "blocked" if !routed => bail!("agent_blocked: {} is waiting on the user in its pane ({})", record.id, record.pane_id),
         "unknown" => bail!("{}'s agent state is unknown; not sending", record.id),
         state => Ok(state.to_string()),
     }
@@ -1041,11 +1042,12 @@ mod tests {
     #[test]
     fn prompt_refusals_and_sending_while_working() {
         let t = Thread { agent_name: String::new(), kind: Kind::Adopted, ..worktree_thread() };
-        assert!(prompt_state(&t, &[]).unwrap_err().to_string().contains("bare shell prompt"));
-        assert!(prompt_state(&t, &[agent("unknown")]).is_err());
-        assert!(prompt_state(&t, &[agent("blocked")]).unwrap_err().to_string().contains("agent_blocked"));
-        assert_eq!(prompt_state(&t, &[agent("working")]).unwrap(), "working");
-        assert_eq!(prompt_state(&t, &[agent("idle")]).unwrap(), "idle");
+        assert!(prompt_state(&t, &[], true).unwrap_err().to_string().contains("bare shell prompt"));
+        assert!(prompt_state(&t, &[agent("unknown")], true).is_err());
+        assert!(prompt_state(&t, &[agent("blocked")], false).unwrap_err().to_string().contains("agent_blocked"));
+        assert_eq!(prompt_state(&t, &[agent("blocked")], true).unwrap(), "blocked");
+        assert_eq!(prompt_state(&t, &[agent("working")], false).unwrap(), "working");
+        assert_eq!(prompt_state(&t, &[agent("idle")], false).unwrap(), "idle");
     }
 
     #[test]

@@ -488,11 +488,14 @@ pub fn prompt(ctx: &Ctx, slug: &str, text: &str) -> Result<()> {
         .agents
         .iter()
         .filter(|a| is_coordinator(&record, a))
-        .filter(|a| a.agent_status != "blocked" && a.agent_status != "unknown")
+        // A blocked coordinator takes the text only when the OMP extension
+        // queues it behind the question.
+        .filter(|a| a.agent_status != "unknown" && (a.agent_status != "blocked" || crate::delivery::routed(&ctx.root, &view.socket, &a.pane_id, false)))
         .max_by_key(|a| a.state_change_seq)
         .with_context(|| format!("no coordinator of `{slug}` can take a prompt right now; `open {slug}` starts one"))?;
-    view.herdr.agent_prompt(&target.pane_id, text).map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!("sent to the coordinator in pane {} (agent was {})", target.pane_id, target.agent_status);
+    let sent = crate::delivery::send(&ctx.root, &view.herdr, &view.socket, &target.pane_id, false, "coordinator", text).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let how = if sent == crate::delivery::Sent::Queued { "queued for" } else { "sent to" };
+    println!("{how} the coordinator in pane {} (agent was {})", target.pane_id, target.agent_status);
     Ok(())
 }
 

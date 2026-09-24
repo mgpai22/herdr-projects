@@ -3,6 +3,7 @@ mod adopt;
 mod agents;
 mod cli;
 mod coordinator;
+mod delivery;
 mod doctor;
 mod herdr;
 mod inbox;

@@ -76,3 +76,29 @@ fn ticker_start_without_projects_creates_nothing() {
     assert!(!home.path().join(".herdr-projects").exists());
     assert!(!home.path().join(".config").exists());
 }
+
+#[test]
+fn configure_and_unconfigure_for_omp_touch_only_our_extension() {
+    let home = tempfile::tempdir().unwrap();
+    let agent = home.path().join("omp-agent");
+    let extensions = agent.join("extensions");
+    std::fs::create_dir_all(&extensions).unwrap();
+    std::fs::write(extensions.join("other.ts"), "// someone else's\n").unwrap();
+    let root = home.path().join("root");
+    let root_arg = root.to_str().unwrap();
+    let omp = |args: &[&str]| Command::new(BIN).env_clear().env("HOME", home.path()).env("PI_CODING_AGENT_DIR", &agent).arg("--root").arg(root_arg).args(args).output().unwrap();
+
+    let out = omp(&["configure", "--clients", "omp", "--hooks-only"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = std::fs::read_to_string(extensions.join("herdr-projects.ts")).unwrap();
+    assert!(text.starts_with("// HERDR_PROJECTS_OMP_VERSION=") && !text.contains("__HP_"), "{text}");
+    assert!(text.contains(&format!("\"{}\"", std::fs::canonicalize(BIN).unwrap().display())));
+    // The extension's hook bridge parses and never fails.
+    assert!(omp(&["hook", "--agent", "omp"]).status.success());
+
+    let out = omp(&["unconfigure"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!extensions.join("herdr-projects.ts").exists());
+    assert!(std::fs::symlink_metadata(agent.join("skills/autoproject")).is_err());
+    assert_eq!(std::fs::read_to_string(extensions.join("other.ts")).unwrap(), "// someone else's\n");
+}

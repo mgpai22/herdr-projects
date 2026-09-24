@@ -232,6 +232,12 @@ fn run_binary(ctx: &Ctx, binary: &Path, args: &[&str]) -> Result<bool> {
 }
 
 pub fn run(ctx: &Ctx, check_only: bool) -> Result<()> {
+    // Releases are upstream's `vX.Y.Z` tags and linked checkouts must be on
+    // `main`: neither fits the fork, which is built from its own branch.
+    if env!("CARGO_PKG_VERSION").contains("-omp") {
+        let root = own_root().map_or_else(|| "<plugin root>".to_string(), |r| r.display().to_string());
+        bail!("this is the OMP fork build; update with `git -C {root} pull` and reinstall with HERDR_PROJECTS_BUILD=source (`HERDR_PROJECTS_BUILD=source sh scripts/install.sh` in {root})");
+    }
     let bin = ctx.env.herdr_bin();
     let session = paths::resolve_session(&SessionFlags::default(), ctx.env, ctx.runner)?;
     let herdr = Herdr::new(&bin, &session.socket, ctx.runner);
@@ -361,5 +367,19 @@ mod tests {
         let runner = FakeRunner::new();
         runner.on("ls-remote", ok(&format!("aaa\trefs/tags/v{}\n", env!("CARGO_PKG_VERSION"))));
         assert_eq!(newer_release(&runner, Some(dir.path())), None);
+    }
+
+    #[test]
+    fn the_fork_build_refuses_to_update_from_upstream_releases() {
+        use crate::runner::fake::FakeRunner;
+        let home = tempfile::tempdir().unwrap();
+        let env = crate::paths::Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx { env: &env, root: home.path().join("root"), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: false };
+        for check_only in [false, true] {
+            let error = run(&ctx, check_only).unwrap_err().to_string();
+            assert!(error.contains("OMP fork build") && error.contains("HERDR_PROJECTS_BUILD=source"), "{error}");
+        }
+        assert!(runner.calls.borrow().is_empty(), "the fork build asked Herdr or git");
     }
 }

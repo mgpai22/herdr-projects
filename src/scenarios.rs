@@ -1949,3 +1949,118 @@ fn an_agent_in_the_threads_folder_is_not_the_coordinator() {
     assert!(project.coordinator().is_none());
     assert_eq!(world.runner.count("report-metadata"), 0);
 }
+
+/// The OMP extension last pulled `pane`'s channel `age` seconds ago.
+fn heartbeat(world: &World, socket: &str, pane: &str, age: i64) {
+    crate::progress::touch_channel(&world.root, socket, pane, "", "omp", crate::progress::now() - age).unwrap();
+}
+
+/// Both the coordinator's and the fixture thread's panes are alive, so their
+/// progress records are not pruned.
+fn both_panes(world: &World, project: &Project) {
+    let cwd = world.home.path().to_string_lossy().into_owned();
+    *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(project), pane_json("w2", "w2:t1", "w2:p1", &cwd));
+}
+
+#[test]
+fn a_brief_is_queued_while_the_omp_extension_pulls_and_typed_once_it_stopped() {
+    for (age, typed) in [(0, 0), (11, 1)] {
+        let (world, project, _) = finished_world("idle");
+        both_panes(&world, &project);
+        settle(&project);
+        thread::update(&project, "t-0001", |t| t.prompt_pending = true).unwrap();
+        let socket = project.coordinator().unwrap().socket;
+        heartbeat(&world, &socket, "w2:p1", age);
+        ticker::tick_project(&world.ctx(), &project).unwrap();
+
+        assert_eq!(world.runner.count("agent prompt"), typed, "heartbeat {age}s old");
+        let queued = crate::delivery::pending(&world.root, &socket, "w2:p1");
+        assert_eq!(queued.len(), 1 - typed);
+        if typed == 0 {
+            assert_eq!((queued[0].kind.as_str(), queued[0].text.as_str()), ("brief", thread::launch_prompt("demo", "t-0001", "claude").as_str()));
+        }
+        // Queued is delivered: no second send, and the thread is Working.
+        let t = thread::load(&project, "t-0001").unwrap();
+        assert!(!t.prompt_pending);
+        assert_eq!(t.last_group, "working");
+    }
+}
+
+#[test]
+fn a_nudge_to_a_coordinator_whose_omp_extension_pulls_is_queued_once() {
+    let (world, project, t) = finished_world("done");
+    both_panes(&world, &project);
+    set_front_matter(&project, "nudge = true");
+    std::fs::create_dir_all(&t.thread_dir).unwrap();
+    std::fs::write(Path::new(&t.thread_dir).join("report.md"), "## Report\ndone\n").unwrap();
+    let socket = project.coordinator().unwrap().socket;
+    let ctx = world.ctx();
+    let mut memory = Memory::new(&ctx);
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    idle_for_a_minute(&project);
+    heartbeat(&world, &socket, "w1:p1", 0);
+    for _ in 0..3 {
+        ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+    }
+    assert_eq!(world.runner.count("agent prompt"), 0);
+    let queued = crate::delivery::pending(&world.root, &socket, "w1:p1");
+    assert_eq!(queued.len(), 1, "{queued:?}");
+    assert_eq!(queued[0].text, crate::steps::NUDGE_TEXT);
+    assert!(!crate::steps::load_state(&project).nudged.is_empty());
+}
+
+#[test]
+fn a_follow_up_to_a_blocked_agent_is_queued_only_while_its_omp_extension_pulls() {
+    let (world, project, _) = finished_world("blocked");
+    both_panes(&world, &project);
+    let socket = project.coordinator().unwrap().socket;
+    let ctx = world.ctx();
+    let task = || std::fs::read_to_string(thread::task_path(&project, "t-0001")).unwrap_or_default();
+
+    heartbeat(&world, &socket, "w2:p1", 11);
+    let refused = threads::prompt(&ctx, "demo", "t-0001", "Also this.").unwrap_err();
+    assert!(refused.to_string().contains("agent_blocked"), "{refused}");
+    assert!(crate::delivery::pending(&world.root, &socket, "w2:p1").is_empty());
+    assert!(!task().contains("Also this."));
+
+    heartbeat(&world, &socket, "w2:p1", 0);
+    assert_eq!(threads::prompt(&ctx, "demo", "t-0001", "Also this.").unwrap(), "blocked");
+    assert_eq!(world.runner.count("agent prompt"), 0);
+    let queued = crate::delivery::pending(&world.root, &socket, "w2:p1");
+    assert_eq!((queued.len(), queued[0].kind.as_str(), queued[0].text.as_str()), (1, "follow-up", "Also this."));
+    assert!(task().ends_with("Also this.\n"));
+}
+
+#[test]
+fn a_remote_brief_is_typed_even_when_a_local_channel_for_its_pane_id_is_live() {
+    let (world, project) = remote_world();
+    thread::update(&project, "t-0001", |t| t.prompt_pending = true).unwrap();
+    let socket = project.coordinator().unwrap().socket;
+    // The remote pass reads with an empty socket; the pane id repeats locally.
+    for s in ["", socket.as_str()] {
+        heartbeat(&world, s, "w2:p1", 0);
+    }
+    let scripted = World { runner: FakeRunner::new(), ..world };
+    scripted.runner.on_fn(
+        |cmd| is_machine_call(cmd) && cmd.display().contains("agent list"),
+        |_| Ok(ok(r#"{"result":{"agents":[{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","cwd":"/home/me/wt","name":"hp-demo-t-0001","agent_status":"idle"}]}}"#)),
+    );
+    scripted.runner.on_fn(is_machine_call, |_| Ok(ok(r#"{"result":{"panes":[]}}"#)));
+    scripted.runner.on("machine list --json", ok(r#"[{"id":"1","label":"box","target":"me@box"}]"#));
+    scripted.runner.on("ssh", ok("t-0001 -\n"));
+    scripted.runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
+    let panes = format!(r#"{{"result":{{"panes":[{}]}}}}"#, scripted.coordinator_pane(&project));
+    scripted.runner.on("pane list", ok(&panes));
+    scripted.runner.on("report-metadata", ok("{}"));
+    let ctx = scripted.ctx();
+    let mut memory = Memory::new(&ctx);
+    memory.tick = 1;
+    ticker::tick_project_with(&ctx, &project, &mut memory).unwrap();
+
+    let typed = scripted.runner.calls.borrow().iter().filter(|c| is_machine_call(c) && c.display().contains("agent prompt")).count();
+    assert_eq!(typed, 1);
+    for s in ["", socket.as_str()] {
+        assert!(crate::delivery::pending(&scripted.root, s, "w2:p1").is_empty());
+    }
+    assert!(!thread::load(&project, "t-0001").unwrap().prompt_pending);
+}
