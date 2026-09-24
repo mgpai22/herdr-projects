@@ -1,5 +1,20 @@
 # Manual test list
 
+## OMP fork (0.2.13-omp.1)
+
+Checked on 2026-09-24 in a scratch `hp-dev` session under a throwaway `HOME` (herdr 0.9.1-custom, Linux x64, OMP 18.3.0, `PI_CODING_AGENT_DIR` pointing at a scratch agent dir).
+
+| Check | How it was checked |
+| --- | --- |
+| `configure --clients omp --hooks-only` installs `extensions/herdr-projects.ts` and the `autoproject` link, both journaled; `doctor` reports them ok | Builder |
+| After a rebuild, `doctor` reports the extension outdated and `doctor --fix` rewrites it to the current render | Builder |
+| `new` writes `.omp/config.yml` with prefix-anchored rules; the OMP coordinator's `<prefix> unconfigure` is refused with "Blocked by bash pattern" | Builder |
+| `coordinator prompt` to an idle OMP coordinator with a half-typed draft is queued, arrives as a user message, and the draft stays in the editor | Builder (`pane send-text` draft, `pane read`) |
+| An OMP thread with a todo list shows `~33%` and its task, `Waiting for you` on `ask`, then `100% · Done` and Ready for review, with no `report` from the model | Builder (`.progress` record, `agent list` tokens) |
+| `thread prompt` to an OMP thread blocked on `ask` is queued ("queued for t-0001 (agent was blocked)") and runs after the answer | Builder |
+| An OMP thread's launch prompt carries `workflowz`, and OMP's workflow notice takes effect | Builder (pane text) |
+| A server restart resumes both OMP panes with profile `default` and the same session files; heartbeats resume | Builder (`agent list`) |
+
 ## 0.2.0: the Herdr-native redesign
 
 Checked on 2026-09-23 in a scratch `hp-dev` session (herdr 0.9.1, macOS, Claude Code 2.1.280). "Builder" means the builder ran it and read the result; "client-witnessed" needs a person looking at an attached Herdr client.
