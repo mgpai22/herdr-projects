@@ -67,6 +67,7 @@ Every other coordinator rule stands, including the parallel cap: before each sta
 
 - **Environment refusals are brakes, not failures.** Classify a failed start only by `hp`'s own message: paused waits with step `paused`; archived or a refused profile stops the run with that reason. A landing refused by policy is `BLOCKED`: leave that maker and its PR open for the user and stop with `landing blocked`. Never try to get around a refusal.
 - **A thread blocked on a prompt** pauses the run with step `blocked t-NNNN`; tell the user which pane needs them and never answer it.
+- **An OMP coordinator's resolve waits for the user.** The project's `.omp/config.yml` makes `hp thread resolve` ask for confirmation in the coordinator pane; say at setup that each resolve needs a confirm, and a declined resolve leaves that thread open.
 - **Every other failure** is one NOT_BETTER iteration under the protocol's failure rule. Never use `hp thread restart`.
 - **Mismatched resume markers** stop the resume, not the user: report and wait.
 

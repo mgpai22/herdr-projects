@@ -208,10 +208,10 @@ enum Command {
         /// Scope it to one project (default: the current workspace's, else all)
         slug: Option<String>,
     },
-    /// Install the plugin's hooks (progress self-reports) and its `autoproject` skill into Claude Code and Codex
+    /// Install the plugin's hooks (progress self-reports) and its `autoproject` skill into Claude Code and Codex, and its extension and skill into OMP
     Configure {
-        /// Harnesses to configure, comma-separated: claude, codex (default: those installed)
-        #[arg(long, value_delimiter = ',', value_parser = ["claude", "codex"])]
+        /// Harnesses to configure, comma-separated: claude, codex, omp (default: those installed; omp means `$PI_CODING_AGENT_DIR`, else ~/.omp/agent)
+        #[arg(long, value_delimiter = ',', value_parser = ["claude", "codex", "omp"])]
         clients: Vec<String>,
         #[arg(long, value_name = "DIR")]
         claude_home: Option<PathBuf>,
@@ -249,8 +249,14 @@ enum Command {
     /// Harness hook entry point (installed by `configure`)
     #[command(hide = true)]
     Hook {
-        #[arg(long, value_parser = ["claude", "codex"])]
+        #[arg(long, value_parser = ["claude", "codex", "omp"])]
         agent: String,
+    },
+    /// Messages for this pane's agent: for the OMP extension; binds to the current pane like `report`
+    #[command(hide = true)]
+    Channel {
+        #[command(subcommand)]
+        command: ChannelCommand,
     },
     /// Print the progress record of this pane, or of --pane
     Progress {
@@ -279,6 +285,20 @@ enum InboxCommand {
         ids: Vec<String>,
         #[arg(long, conflicts_with = "ids")]
         all: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ChannelCommand {
+    /// Print this pane's pending messages as JSON, oldest first, and record that the extension is alive
+    Pull {
+        #[arg(long, value_parser = ["omp"])]
+        agent: String,
+    },
+    /// Remove delivered messages
+    Ack {
+        #[arg(value_name = "ID", required = true)]
+        ids: Vec<String>,
     },
 }
 
@@ -453,6 +473,9 @@ struct ProfileFields {
     /// An extra argument for the agent CLI, repeatable (--arg --config --arg ~/.omp/agent/luna.yml)
     #[arg(long = "arg", value_name = "ARG", allow_hyphen_values = true)]
     args: Vec<String>,
+    /// The OMP profile an omp profile launches (herdr's [session.omp_launchers]; empty: OMP's default); only for --agent omp
+    #[arg(long, value_name = "PROFILE")]
+    omp_profile: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -553,7 +576,7 @@ fn profile_change(ctx: &Ctx, command: ProfileCommand) -> Result<crate::profiles:
         ProfileCommand::List { .. } => bail!("`profile list` changes nothing"),
         ProfileCommand::Add { name, agent, fields } => Change::Add {
             name,
-            entry: Entry { agent, model: fields.model.unwrap_or_default(), effort: fields.effort.unwrap_or_default(), args: fields.args, description: fields.description.unwrap_or_default() },
+            entry: Entry { agent, model: fields.model.unwrap_or_default(), effort: fields.effort.unwrap_or_default(), args: fields.args, description: fields.description.unwrap_or_default(), omp_profile: fields.omp_profile.unwrap_or_default() },
         },
         ProfileCommand::Edit { name, agent, fields, clear_args } => Change::Edit {
             name,
@@ -562,6 +585,7 @@ fn profile_change(ctx: &Ctx, command: ProfileCommand) -> Result<crate::profiles:
             effort: fields.effort,
             description: fields.description,
             args: if clear_args { Some(Vec::new()) } else { (!fields.args.is_empty()).then_some(fields.args) },
+            omp_profile: fields.omp_profile,
         },
         ProfileCommand::Remove { name } => Change::Remove { name },
         ProfileCommand::Allow { role, names, project, all } => Change::Allow {
@@ -615,7 +639,7 @@ pub fn run() -> Result<()> {
             let project = project::create(&ctx.root, &name, &goal, repos)?;
             crate::profiles::write_project_defaults(&project, &thread, &coordinator)?;
             let prefix = coordinator::current_prefix(&ctx.root)?;
-            project::write_priming(&project, &prefix)?;
+            project::write_priming(&project, &prefix, ctx.env, &ctx.config_dir)?;
             println!("created `{}` at {}", project.slug, project.dir().display());
             println!("next: {prefix} open {}", project.slug);
             Ok(())
@@ -677,7 +701,7 @@ pub fn run() -> Result<()> {
             }
             ThreadCommand::Restart { slug, id, profile } => {
                 let thread = threads::restart(&ctx, &slug, &id, profile.as_deref())?;
-                println!("{} is back in pane {}; the ticker launches its {} agent", thread.id, thread.pane_id, if thread.profile.is_empty() { &thread.agent } else { &thread.profile });
+                println!("{} is back in pane {}; the ticker launches its {} agent", thread.id, thread.pane_id, thread.profile_name());
                 Ok(())
             }
             ThreadCommand::Next { slug, id, line, add } => threads::next(&ctx, &slug, &id, line, add.as_deref()),
@@ -687,8 +711,9 @@ pub fn run() -> Result<()> {
             ThreadCommand::Keys { slug, id, keys, text } => threads::keys(&ctx, &slug, &id, &keys, text.as_deref()),
             ThreadCommand::Prompt { slug, id, text_file } => {
                 let text = read_text(&text_file)?;
-                let state = threads::prompt(&ctx, &slug, &id, &text)?;
-                println!("sent to {id} (agent was {state})");
+                let (state, sent) = threads::prompt(&ctx, &slug, &id, &text)?;
+                let how = if sent == crate::delivery::Sent::Queued { "queued for" } else { "sent to" };
+                println!("{how} {id} (agent was {state})");
                 Ok(())
             }
             ThreadCommand::Adopt { slug, pane, title, task_file } => {
@@ -820,6 +845,10 @@ pub fn run() -> Result<()> {
             let _ = crate::progress::hook(&ctx, &agent);
             Ok(())
         }
+        Command::Channel { command } => match command {
+            ChannelCommand::Pull { agent: _ } => crate::delivery::pull(&ctx),
+            ChannelCommand::Ack { ids } => crate::delivery::ack(&ctx, &ids),
+        },
         Command::Progress { pane } => crate::progress::print(&ctx, pane.as_deref()),
         Command::Update { check } => crate::update::run(&ctx, check),
         Command::Ticker { command } => match command {

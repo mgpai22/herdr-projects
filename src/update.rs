@@ -133,10 +133,23 @@ fn latest_release(runner: &dyn Runner, root: &Path, timeout: Duration) -> Result
     Ok(newest_release(&out.stdout))
 }
 
+/// Releases are upstream's `vX.Y.Z` tags and linked checkouts must be on
+/// `main`: neither fits the fork, which is built from its own branch.
+pub fn fork_build() -> bool {
+    env!("CARGO_PKG_VERSION").contains("-omp")
+}
+
 /// For `doctor`: the newer release, when there is one. Never fails: offline,
-/// no git, or a binary outside a checkout all mean "nothing to say".
+/// no git, a binary outside a checkout, or the fork build (whose `update`
+/// refuses) all mean "nothing to say".
 pub fn newer_release(runner: &dyn Runner, root: Option<&Path>) -> Option<Version> {
-    let root = root?;
+    if fork_build() {
+        return None;
+    }
+    newer_than_own(runner, root?)
+}
+
+fn newer_than_own(runner: &dyn Runner, root: &Path) -> Option<Version> {
     if !root.join(".git").exists() {
         return None;
     }
@@ -232,6 +245,13 @@ fn run_binary(ctx: &Ctx, binary: &Path, args: &[&str]) -> Result<bool> {
 }
 
 pub fn run(ctx: &Ctx, check_only: bool) -> Result<()> {
+    if fork_build() {
+        let root = own_root().map_or_else(|| "<plugin root>".to_string(), |r| r.display().to_string());
+        if cfg!(windows) {
+            bail!("this is the OMP fork build; update with `git -C {root} pull` and reinstall with `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\install.ps1` in {root}");
+        }
+        bail!("this is the OMP fork build; update with `git -C {root} pull` and reinstall with HERDR_PROJECTS_BUILD=source (`HERDR_PROJECTS_BUILD=source sh scripts/install.sh` in {root})");
+    }
     let bin = ctx.env.herdr_bin();
     let session = paths::resolve_session(&SessionFlags::default(), ctx.env, ctx.runner)?;
     let herdr = Herdr::new(&bin, &session.socket, ctx.runner);
@@ -348,18 +368,44 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runner = FakeRunner::new();
         assert_eq!(newer_release(&runner, None), None);
-        assert_eq!(newer_release(&runner, Some(dir.path())), None);
+        assert_eq!(newer_than_own(&runner, dir.path()), None);
         assert_eq!(runner.count("ls-remote"), 0);
 
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         runner.on("ls-remote", fail(128, "could not resolve host"));
-        assert_eq!(newer_release(&runner, Some(dir.path())), None);
+        assert_eq!(newer_than_own(&runner, dir.path()), None);
 
         let runner = FakeRunner::new();
         runner.on("ls-remote", ok("aaa\trefs/tags/v999.0.0\n"));
-        assert_eq!(newer_release(&runner, Some(dir.path())), Some(Version(999, 0, 0)));
+        assert_eq!(newer_than_own(&runner, dir.path()), Some(Version(999, 0, 0)));
         let runner = FakeRunner::new();
         runner.on("ls-remote", ok(&format!("aaa\trefs/tags/v{}\n", env!("CARGO_PKG_VERSION"))));
+        assert_eq!(newer_than_own(&runner, dir.path()), None);
+    }
+
+    #[test]
+    fn the_fork_build_never_advertises_an_upstream_release() {
+        use crate::runner::fake::{FakeRunner, ok};
+        assert!(fork_build(), "this checkout is the fork");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let runner = FakeRunner::new();
+        runner.on("ls-remote", ok("aaa\trefs/tags/v999.0.0\n"));
         assert_eq!(newer_release(&runner, Some(dir.path())), None);
+    }
+
+    #[test]
+    fn the_fork_build_refuses_to_update_from_upstream_releases() {
+        use crate::runner::fake::FakeRunner;
+        let home = tempfile::tempdir().unwrap();
+        let env = crate::paths::Env::for_test(home.path(), &[]);
+        let runner = FakeRunner::new();
+        let ctx = Ctx { env: &env, root: home.path().join("root"), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: false };
+        for check_only in [false, true] {
+            let error = run(&ctx, check_only).unwrap_err().to_string();
+            let hint = if cfg!(windows) { "scripts\\install.ps1" } else { "HERDR_PROJECTS_BUILD=source" };
+            assert!(error.contains("OMP fork build") && error.contains(hint), "{error}");
+        }
+        assert!(runner.calls.borrow().is_empty(), "the fork build asked Herdr or git");
     }
 }

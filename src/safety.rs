@@ -32,7 +32,8 @@ pub const RESTART_NOTE: &str = "agents launched from now on use it; running agen
 /// The flag that makes an agent of `kind` stop asking for permission, or
 /// `None` when no such flag is known for the kind. Each harness has its own:
 /// Claude Code's flag makes Codex refuse to start, so there is no shared list.
-/// Pi has no permission prompts, so it needs none.
+/// Pi has no permission prompts, so it needs none. OMP's approval mode is its
+/// own config setting, so it gets none either.
 pub fn yolo_flags(kind: &str) -> Option<&'static [&'static str]> {
     Some(match kind {
         "claude" => &["--dangerously-skip-permissions"],
@@ -42,7 +43,7 @@ pub fn yolo_flags(kind: &str) -> Option<&'static [&'static str]> {
         "opencode" => &["--auto"],
         "copilot" => &["--allow-all-tools"],
         "amp" => &["--dangerously-allow-all"],
-        "pi" => &[],
+        "pi" | "omp" => &[],
         _ => return None,
     })
 }
@@ -265,6 +266,7 @@ fn flags_text(kinds: &[&str]) -> Vec<String> {
             continue;
         }
         let text = match yolo_flags(kind) {
+            Some([]) if *kind == "omp" => "nothing (OMP's approvalMode config decides; a coordinator's .omp/config.yml deny and confirm rules still apply)".to_string(),
             Some([]) => "nothing (it never asks)".to_string(),
             Some(flags) => flags.join(" "),
             None => "no known flag: its agents still ask".to_string(),
@@ -325,6 +327,8 @@ mod tests {
         assert_eq!(yolo_flags("codex").unwrap(), ["--dangerously-bypass-approvals-and-sandbox"]);
         assert_eq!(yolo_flags("gemini").unwrap(), ["--yolo"]);
         assert!(yolo_flags("pi").unwrap().is_empty());
+        assert!(yolo_flags("omp").unwrap().is_empty());
+        assert_eq!(flags_text(&["omp", "pi", "omp"]), ["omp: nothing (OMP's approvalMode config decides; a coordinator's .omp/config.yml deny and confirm rules still apply)", "pi: nothing (it never asks)"]);
         assert_eq!(yolo_flags("kiro"), None);
         for kind in crate::agents::KINDS {
             for flag in yolo_flags(kind).unwrap_or_default() {

@@ -4,9 +4,11 @@
 //! coordinators may use. Agents only ever choose a profile by name.
 //!
 //! Every Herdr agent kind is also a built-in profile of the same name with no
-//! arguments; a user profile of that name replaces it. Built-ins are listed
-//! (in `profile list`, `context` and the popup) only when their CLI is
-//! installed and looks signed in, but any of them can be named.
+//! arguments, and every named OMP profile `<name>` is the built-in `omp-<name>`
+//! (harness omp under that OMP profile); a user profile of that name replaces
+//! it. Built-ins are listed (in `profile list`, `context` and the popup) only
+//! when their CLI is installed and looks signed in, but any of them can be
+//! named.
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal as _;
@@ -68,6 +70,9 @@ pub struct Entry {
     pub effort: String,
     pub args: Vec<String>,
     pub description: String,
+    /// The OMP profile an `omp` profile launches under (herdr's `agent start
+    /// --profile`); empty: OMP's default profile. Only for harness omp.
+    pub omp_profile: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +86,11 @@ pub struct Profile {
 impl Profile {
     fn builtin(kind: &str) -> Profile {
         Profile { name: kind.to_string(), entry: Entry { agent: kind.to_string(), ..Entry::default() }, builtin: true }
+    }
+
+    /// The built-in `omp-<name>`: harness omp under OMP profile `<name>`.
+    fn omp_builtin(omp_profile: &str) -> Profile {
+        Profile { name: format!("omp-{omp_profile}"), entry: Entry { agent: "omp".into(), omp_profile: omp_profile.to_string(), ..Entry::default() }, builtin: true }
     }
 
     pub fn agent(&self) -> &str {
@@ -100,6 +110,9 @@ impl Profile {
     pub fn summary(&self) -> String {
         let e = &self.entry;
         let mut parts = vec![e.agent.clone(), if e.model.is_empty() { "default model".into() } else { format!("model {}", e.model) }];
+        if !e.omp_profile.is_empty() {
+            parts.insert(1, format!("OMP profile {}", e.omp_profile));
+        }
         if !e.effort.is_empty() {
             parts.push(format!("effort {}", e.effort));
         }
@@ -146,19 +159,26 @@ pub fn load(config_dir: &Path) -> Result<Config> {
 }
 
 impl Config {
-    /// A profile by name: the user's table, else the built-in of that kind.
+    /// A profile by name: the user's table, else the built-in of that kind
+    /// or OMP profile.
     pub fn get(&self, name: &str) -> Option<Profile> {
         match self.profiles.get(name) {
-            Some(entry) => Some(Profile { name: name.to_string(), entry: entry.clone(), builtin: false }),
-            None => crate::agents::is_kind(name).then(|| Profile::builtin(name)),
+            Some(entry) => {
+                let mut entry = entry.clone();
+                // `load` checked it; `default` and spaces normalize away.
+                entry.omp_profile = crate::omp::normalize_profile(&entry.omp_profile).unwrap_or_default();
+                Some(Profile { name: name.to_string(), entry, builtin: false })
+            }
+            None if crate::agents::is_kind(name) => Some(Profile::builtin(name)),
+            None => omp_builtin_profile(name).map(|p| Profile::omp_builtin(&p)),
         }
     }
 
-    /// The user's profiles, then the built-ins of `detected` kinds they do
-    /// not replace.
+    /// The user's profiles, then the `detected` built-ins they do not
+    /// replace.
     pub fn listed(&self, detected: &[String]) -> Vec<Profile> {
         let mut out: Vec<Profile> = self.profiles.keys().filter_map(|n| self.get(n)).collect();
-        out.extend(detected.iter().filter(|k| !self.profiles.contains_key(*k)).map(|k| Profile::builtin(k)));
+        out.extend(detected.iter().filter(|k| !self.profiles.contains_key(*k)).filter_map(|k| self.get(k)));
         out
     }
 
@@ -182,8 +202,24 @@ impl Config {
     }
 }
 
-/// A profile name: letters, digits, `.`, `_` and `-`, up to 40 characters.
+/// The OMP profile a built-in name `omp-<name>` stands for: a named OMP
+/// profile in OMP's own spelling (not `default`, which is the built-in `omp`).
+pub fn omp_builtin_profile(name: &str) -> Option<String> {
+    let profile = name.strip_prefix("omp-")?;
+    crate::omp::normalize_profile(profile).ok().filter(|p| !p.is_empty() && p == profile)
+}
+
+/// Whether `name` is a built-in profile a user table may replace.
+fn is_builtin_name(name: &str) -> bool {
+    crate::agents::is_kind(name) || omp_builtin_profile(name).is_some()
+}
+
+/// A profile name: letters, digits, `.`, `_` and `-`, up to 40 characters,
+/// or a built-in `omp-<name>` (OMP allows 64 characters for `<name>`).
 pub fn validate_name(name: &str) -> Result<()> {
+    if omp_builtin_profile(name).is_some() {
+        return Ok(());
+    }
     if name.is_empty() || name.len() > 40 || name.starts_with(['-', '.']) || !name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
         bail!("`{name}` is not a profile name: use letters, digits, `.`, `_` and `-` (at most 40)");
     }
@@ -196,6 +232,10 @@ fn validate(name: &str, entry: &Entry) -> Result<()> {
         bail!("agent `{}` is not a Herdr agent kind ({})", entry.agent, crate::agents::KINDS.join(", "));
     }
     typed_args(&entry.agent, &entry.model, &entry.effort)?;
+    let omp_profile = crate::omp::normalize_profile(&entry.omp_profile)?;
+    if !omp_profile.is_empty() && entry.agent != "omp" {
+        bail!("omp_profile `{omp_profile}` needs agent omp, not {}: an OMP profile is OMP's alone", entry.agent);
+    }
     Ok(())
 }
 
@@ -343,10 +383,19 @@ pub fn executable(kind: &str) -> &str {
 }
 
 fn on_path(env: &Env, name: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    env.var("PATH").unwrap_or("").split(':').filter(|d| !d.is_empty()).any(|dir| {
-        std::fs::metadata(Path::new(dir).join(name)).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-    })
+    let dirs = std::env::split_paths(env.var("PATH").unwrap_or("")).filter(|d| !d.as_os_str().is_empty()).collect::<Vec<_>>();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        dirs.iter().any(|dir| std::fs::metadata(dir.join(name)).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+    }
+    // As cmd.exe finds it: each `PATHEXT` extension in each folder.
+    #[cfg(windows)]
+    {
+        let pathext = env.var("PATHEXT").filter(|e| !e.trim().is_empty()).unwrap_or(".COM;.EXE;.BAT;.CMD");
+        let names: Vec<String> = pathext.split(';').map(str::trim).filter(|e| !e.is_empty()).map(|e| format!("{name}{e}")).collect();
+        dirs.iter().any(|dir| names.iter().any(|n| dir.join(n).is_file()))
+    }
 }
 
 /// Whether `kind` looks signed in, from files and variables only (no network,
@@ -379,14 +428,26 @@ fn signed_in(env: &Env, kind: &str) -> bool {
         // The token is in the keychain; the config file appears at sign-in.
         "cursor" => any_var(&["CURSOR_API_KEY"]) || home.join(".cursor/cli-config.json").is_file(),
         "pi" => any_file(&[dir_of("PI_CODING_AGENT_DIR", ".pi/agent").join("auth.json")]) || any_var(&["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"]),
-        "omp" => any_file(&[home.join(".omp/agent/agent.db"), home.join(".omp/agent/.env"), home.join(".omp/.env")]) || any_var(&["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"]),
+        "omp" => omp_signed_in(env, ""),
         _ => true,
     }
 }
 
-/// The kinds whose CLI is on `PATH` and looks signed in, in Herdr's order.
+/// Whether OMP looks signed in under OMP profile `profile` (`""`: default).
+fn omp_signed_in(env: &Env, profile: &str) -> bool {
+    let agent = crate::omp::agent_dir(env, profile);
+    [agent.join("agent.db"), agent.join(".env"), env.home.join(".omp/.env")].iter().any(|p| p.is_file())
+        || ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"].iter().any(|n| env.var(n).is_some())
+}
+
+/// The kinds whose CLI is on `PATH` and looks signed in, in Herdr's order,
+/// then `omp-<name>` for each named OMP profile that looks signed in.
 pub fn detect(env: &Env) -> Vec<String> {
-    crate::agents::KINDS.iter().filter(|k| on_path(env, executable(k)) && signed_in(env, k)).map(|k| k.to_string()).collect()
+    let mut out: Vec<String> = crate::agents::KINDS.iter().filter(|k| on_path(env, executable(k)) && signed_in(env, k)).map(|k| k.to_string()).collect();
+    if on_path(env, executable("omp")) {
+        out.extend(crate::omp::profile_agent_dirs(env).into_iter().filter(|(name, _)| !name.is_empty() && omp_signed_in(env, name)).map(|(name, _)| format!("omp-{name}")));
+    }
+    out
 }
 
 // ---------------------------------------------------------------- editing
@@ -397,7 +458,8 @@ pub fn detect(env: &Env) -> Vec<String> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Change {
     Add { name: String, entry: Entry },
-    Edit { name: String, agent: Option<String>, model: Option<String>, effort: Option<String>, description: Option<String>, args: Option<Vec<String>> },
+    /// `omp_profile: Some("")` goes back to OMP's default profile.
+    Edit { name: String, agent: Option<String>, model: Option<String>, effort: Option<String>, description: Option<String>, args: Option<Vec<String>>, omp_profile: Option<String> },
     Remove { name: String },
     /// `names: None` removes the list: every profile is allowed.
     Allow { role: Role, project: Option<PathBuf>, names: Option<Vec<String>> },
@@ -436,13 +498,14 @@ pub fn apply_in(text: &str, change: &Change) -> Result<(String, String)> {
     let message = match change {
         Change::Add { name, entry } => {
             validate(name, entry)?;
+            let entry = &Entry { omp_profile: crate::omp::normalize_profile(&entry.omp_profile)?, ..entry.clone() };
             if current.profiles.contains_key(name) {
                 bail!("profile `{name}` already exists; `profile edit {name}` changes it");
             }
             let profiles = table(&mut doc, "profiles")?;
             let mut t = Table::new();
             t["agent"] = toml_edit::value(&entry.agent);
-            for (key, value) in [("model", &entry.model), ("effort", &entry.effort), ("description", &entry.description)] {
+            for (key, value) in [("model", &entry.model), ("effort", &entry.effort), ("description", &entry.description), ("omp_profile", &entry.omp_profile)] {
                 if !value.is_empty() {
                     t[key] = toml_edit::value(value);
                 }
@@ -451,17 +514,24 @@ pub fn apply_in(text: &str, change: &Change) -> Result<(String, String)> {
                 t["args"] = string_array(&entry.args);
             }
             profiles[name] = Item::Table(t);
-            let replaces = if crate::agents::is_kind(name) { format!(" (it replaces the built-in `{name}`)") } else { String::new() };
+            let replaces = if is_builtin_name(name) { format!(" (it replaces the built-in `{name}`)") } else { String::new() };
             format!("added profile `{name}`{replaces}: {}", Profile { name: name.clone(), entry: entry.clone(), builtin: false }.summary())
         }
-        Change::Edit { name, agent, model, effort, description, args } => {
+        Change::Edit { name, agent, model, effort, description, args, omp_profile } => {
             let mut entry = current.profiles.get(name).cloned().with_context(|| format!("there is no profile `{name}` in config.toml; `profile add` makes one"))?;
             if let Some(agent) = agent {
                 if *agent != entry.agent && effort.is_none() && effort_values(agent).is_none() {
                     // Another harness: an effort it cannot take goes.
                     entry.effort.clear();
                 }
+                if agent != "omp" && omp_profile.is_none() {
+                    // So does an OMP profile.
+                    entry.omp_profile.clear();
+                }
                 entry.agent = agent.clone();
+            }
+            if let Some(value) = omp_profile {
+                entry.omp_profile = crate::omp::normalize_profile(value)?;
             }
             for (field, value) in [(&mut entry.model, model), (&mut entry.effort, effort), (&mut entry.description, description)] {
                 if let Some(value) = value {
@@ -474,7 +544,7 @@ pub fn apply_in(text: &str, change: &Change) -> Result<(String, String)> {
             validate(name, &entry)?;
             let t = doc["profiles"][name.as_str()].as_table_mut().with_context(|| format!("[profiles.{name}] is not a table"))?;
             t["agent"] = toml_edit::value(&entry.agent);
-            for (key, value) in [("model", &entry.model), ("effort", &entry.effort), ("description", &entry.description)] {
+            for (key, value) in [("model", &entry.model), ("effort", &entry.effort), ("description", &entry.description), ("omp_profile", &entry.omp_profile)] {
                 if value.is_empty() {
                     t.remove(key);
                 } else {
@@ -490,10 +560,10 @@ pub fn apply_in(text: &str, change: &Change) -> Result<(String, String)> {
         }
         Change::Remove { name } => {
             if !current.profiles.contains_key(name) {
-                bail!("there is no profile `{name}` in config.toml{}", if crate::agents::is_kind(name) { " (a built-in profile cannot be removed)" } else { "" });
+                bail!("there is no profile `{name}` in config.toml{}", if is_builtin_name(name) { " (a built-in profile cannot be removed)" } else { "" });
             }
             table(&mut doc, "profiles")?.remove(name);
-            let back = if crate::agents::is_kind(name) { format!("; the built-in `{name}` is back") } else { String::new() };
+            let back = if is_builtin_name(name) { format!("; the built-in `{name}` is back") } else { String::new() };
             format!("removed profile `{name}`{back}")
         }
         Change::Allow { role, project, names } => {
@@ -731,6 +801,7 @@ mod tests {
         assert_eq!((s.thread_profile.as_str(), s.coordinator_profile.as_str()), ("codex", "gemini"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn built_ins_are_the_installed_and_signed_in_kinds() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -748,13 +819,22 @@ mod tests {
         std::fs::write(home.path().join(".claude.json"), "{\"oauthAccount\":{}}").unwrap();
         std::fs::create_dir_all(home.path().join(".omp/agent")).unwrap();
         std::fs::write(home.path().join(".omp/agent/agent.db"), "").unwrap();
+        // A named OMP profile is a built-in once it looks signed in.
+        std::fs::create_dir_all(home.path().join(".omp/profiles/neurable/agent")).unwrap();
+        std::fs::write(home.path().join(".omp/profiles/neurable/agent/agent.db"), "").unwrap();
+        std::fs::create_dir_all(home.path().join(".omp/profiles/cold/agent")).unwrap();
         let path = bin.to_string_lossy().into_owned();
         let env = Env::for_test(home.path(), &[("PATH", &path), ("CURSOR_API_KEY", "k")]);
         // gemini is installed but not signed in; pi is not executable.
-        assert_eq!(detect(&env), strings(&["claude", "codex", "cursor", "omp"]));
+        assert_eq!(detect(&env), strings(&["claude", "codex", "cursor", "omp", "omp-neurable"]));
         let config: Config = toml::from_str(CONFIG).unwrap();
         let names: Vec<String> = config.listed(&detect(&env)).into_iter().map(|p| p.name).collect();
-        assert_eq!(names, strings(&["claude", "deep", "luna", "codex", "cursor", "omp"]));
+        assert_eq!(names, strings(&["claude", "deep", "luna", "codex", "cursor", "omp", "omp-neurable"]));
+        let neurable = config.get("omp-neurable").unwrap();
+        assert!(neurable.builtin && neurable.agent() == "omp" && neurable.entry.omp_profile == "neurable");
+        // Without omp on PATH no OMP profile is listed.
+        let env = Env::for_test(home.path(), &[("PATH", "/nowhere")]);
+        assert!(detect(&env).is_empty());
     }
 
     #[test]
@@ -768,12 +848,12 @@ mod tests {
         assert!(apply_in("", &Change::Add { name: "x".into(), entry: Entry { agent: "gpt".into(), ..Entry::default() } }).is_err());
         assert!(apply_in("", &Change::Add { name: "bad name".into(), entry: luna.clone() }).is_err());
 
-        let edit = Change::Edit { name: "deep".into(), agent: None, model: Some(String::new()), effort: Some("xhigh".into()), description: None, args: Some(strings(&["--search"])) };
+        let edit = Change::Edit { name: "deep".into(), agent: None, model: Some(String::new()), effort: Some("xhigh".into()), description: None, args: Some(strings(&["--search"])), omp_profile: None };
         let (text, _) = apply_in(&text, &edit).unwrap();
         let deep = toml::from_str::<Config>(&text).unwrap().profiles["deep"].clone();
         assert_eq!((deep.model.as_str(), deep.effort.as_str(), deep.args.clone()), ("", "xhigh", strings(&["--search"])));
         // Switching harness drops an effort the new one cannot take.
-        let (text, _) = apply_in(&text, &Change::Edit { name: "deep".into(), agent: Some("gemini".into()), model: None, effort: None, description: None, args: None }).unwrap();
+        let (text, _) = apply_in(&text, &Change::Edit { name: "deep".into(), agent: Some("gemini".into()), model: None, effort: None, description: None, args: None, omp_profile: None }).unwrap();
         assert_eq!(toml::from_str::<Config>(&text).unwrap().profiles["deep"].effort, "");
 
         let allow = Change::Allow { role: Role::Coordinator, project: Some("/p/demo".into()), names: Some(strings(&["claude"])) };
@@ -796,5 +876,63 @@ mod tests {
         std::fs::write(dir.path().join("config.toml"), &text).unwrap();
         let safety = project::load_safety(dir.path(), Path::new("/p/demo")).unwrap();
         assert_eq!(safety.coordinator_profiles, Some(strings(&["claude"])));
+    }
+
+    #[test]
+    fn omp_profiles_are_built_ins_and_a_field_of_omp_profiles_only() {
+        // `omp-<name>` names a built-in for any valid OMP profile name.
+        let config = Config::default();
+        let neurable = config.get("omp-neurable").unwrap();
+        assert_eq!((neurable.builtin, neurable.agent(), neurable.entry.omp_profile.as_str()), (true, "omp", "neurable"));
+        assert!(neurable.args().is_empty() && neurable.summary().starts_with("omp · OMP profile neurable · default model"), "{}", neurable.summary());
+        for bad in ["omp-", "omp-default", "omp-Bad", "omp-a."] {
+            assert_eq!(config.get(bad), None, "{bad}");
+        }
+        assert_eq!(config.get("omp").unwrap().entry.omp_profile, "");
+        // Allow-lists and defaults treat it like any profile.
+        let safety = project::Safety { thread_profiles: Some(strings(&["omp-neurable"])), ..project::Safety::default() };
+        assert_eq!(resolve(&config, &safety, &settings("omp-neurable"), Role::Thread, None, "x").unwrap().entry.omp_profile, "neurable");
+        assert!(resolve(&config, &safety, &settings("omp-neurable"), Role::Thread, Some("omp"), "x").is_err());
+        let (text, _) = apply_in("", &Change::Default { role: Role::Coordinator, name: "omp-neurable".into() }).unwrap();
+        assert_eq!(toml::from_str::<Config>(&text).unwrap().new_project_default(Role::Coordinator), "omp-neurable");
+        // OMP allows 64 characters, more than a profile name's 40: the built-in
+        // is still allowed and made a default, and a longer one is not a name.
+        let long = format!("omp-{}", "a".repeat(64));
+        let (text, _) = apply_in("", &Change::Allow { role: Role::Thread, project: None, names: Some(vec![long.clone()]) }).unwrap();
+        assert!(text.contains(&long), "{text}");
+        assert!(apply_in("", &Change::Default { role: Role::Thread, name: long.clone() }).is_ok());
+        assert!(validate_name(&format!("omp-{}", "a".repeat(65))).is_err());
+        assert!(validate_name(&"a".repeat(41)).is_err());
+        // A legacy PROJECT.md resolves to it.
+        let (legacy, _) = project::parse_project_md("+++\nthread_agent = \"omp\"\nomp_profile = \"neurable\"\n+++\n").unwrap();
+        assert_eq!(resolve(&config, &project::Safety::default(), &legacy, Role::Thread, None, "x").unwrap().name, "omp-neurable");
+
+        // A user profile carries one, normalized; only harness omp may.
+        let work = Entry { agent: "omp".into(), model: "opus".into(), omp_profile: " work ".into(), ..Entry::default() };
+        let (text, message) = apply_in("", &Change::Add { name: "omp-work".into(), entry: work.clone() }).unwrap();
+        assert!(message.contains("replaces the built-in `omp-work`") && message.contains("OMP profile work"), "{message}");
+        assert!(text.contains("omp_profile = \"work\""), "{text}");
+        assert_eq!(load_text(&text).get("omp-work").unwrap().entry.omp_profile, "work");
+        let refused = apply_in("", &Change::Add { name: "c".into(), entry: Entry { agent: "claude".into(), ..work.clone() } }).unwrap_err().to_string();
+        assert!(refused.contains("needs agent omp"), "{refused}");
+        assert!(apply_in("", &Change::Add { name: "c".into(), entry: Entry { omp_profile: "Bad Name".into(), ..work.clone() } }).is_err());
+        assert!(load_text("[profiles.c]\nagent = \"codex\"\nomp_profile = \"work\"\n").profiles.is_empty(), "load refuses it");
+
+        // Edit sets and clears it; another harness drops it.
+        let edit = |omp_profile: Option<&str>, agent: Option<&str>| Change::Edit { name: "omp-work".into(), agent: agent.map(str::to_string), model: None, effort: None, description: None, args: None, omp_profile: omp_profile.map(str::to_string) };
+        let (text, _) = apply_in(&text, &edit(Some("default"), None)).unwrap();
+        assert!(!text.contains("omp_profile"), "{text}");
+        let (text, _) = apply_in(&text, &edit(Some("neurable"), None)).unwrap();
+        assert_eq!(load_text(&text).profiles["omp-work"].omp_profile, "neurable");
+        assert!(apply_in(&text, &edit(Some("neurable"), Some("claude"))).is_err(), "claude with an OMP profile");
+        let (text, _) = apply_in(&text, &edit(None, Some("claude"))).unwrap();
+        assert_eq!(load_text(&text).profiles["omp-work"], Entry { agent: "claude".into(), model: "opus".into(), ..Entry::default() });
+    }
+
+    /// `load` of a config.toml holding `text`; an invalid one loads empty.
+    fn load_text(text: &str) -> Config {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), text).unwrap();
+        load(dir.path()).unwrap_or_default()
     }
 }

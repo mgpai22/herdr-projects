@@ -75,6 +75,19 @@ pub fn set_in(text: &str, key: &str, value: &str) -> Result<String> {
     let (front, body) = split(text)?;
     let mut doc = front.parse::<DocumentMut>().context("PROJECT.md front matter does not parse")?;
     let value = value.trim();
+    // A pre-profiles `omp_profile` goes, written out as `parse_project_md` reads it.
+    if let Some(legacy) = doc.remove("omp_profile") {
+        let legacy = legacy.as_str().unwrap_or_default().to_string();
+        for role in ["thread", "coordinator"] {
+            let old = [format!("{role}_profile"), format!("{role}_agent")].into_iter().find(|k| doc.contains_key(k));
+            if let Some(old) = old
+                && let Some(migrated) = project::legacy_omp_default(doc[&old].as_str().unwrap_or_default(), &legacy)
+            {
+                doc.remove(&old);
+                doc[&format!("{role}_profile")] = toml_edit::value(migrated);
+            }
+        }
+    }
     match key {
         "name" | "goal" => {
             if key == "name" && value.is_empty() {
@@ -89,6 +102,7 @@ pub fn set_in(text: &str, key: &str, value: &str) -> Result<String> {
             doc.remove(&format!("{role}_agent"));
             doc[&format!("{role}_profile")] = toml_edit::value(value);
         }
+        "omp_profile" => bail!("omp_profile is gone: an OMP profile is part of an agent profile now; set thread_profile or coordinator_profile to `omp-<name>` (`profile list` shows them)"),
         "max_parallel_threads" | "auto_resolve_days" => {
             let n: i64 = value.parse().ok().filter(|n: &i64| *n >= 0 && *n <= 1000).with_context(|| format!("`{value}` is not a number from 0 to 1000"))?;
             if key == "max_parallel_threads" && n == 0 {
@@ -104,7 +118,7 @@ pub fn set_in(text: &str, key: &str, value: &str) -> Result<String> {
             }
             let path = match repo.machine {
                 Some(_) => repo.path.clone(),
-                None => std::fs::canonicalize(&repo.path).map(|p| p.to_string_lossy().into_owned()).unwrap_or(repo.path.clone()),
+                None => crate::paths::canonicalize(&repo.path).map(|p| p.to_string_lossy().into_owned()).unwrap_or(repo.path.clone()),
             };
             normalize_repos(&mut doc)?;
             let repos = doc["repos"].as_array_of_tables_mut().context("`repos` must be [[repos]] tables")?;
@@ -142,7 +156,7 @@ pub fn set_in(text: &str, key: &str, value: &str) -> Result<String> {
 /// `set <slug> <key> <value>`.
 pub fn set(ctx: &Ctx, slug: &str, key: &str, value: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
-    if let Some(role) = key.strip_suffix("_profile").or(key.strip_suffix("_agent")) {
+    if let Some(role) = key.strip_suffix("_profile").or(key.strip_suffix("_agent")).filter(|role| matches!(*role, "thread" | "coordinator")) {
         // A default must be a profile this project may use.
         let role = crate::profiles::Role::parse(role)?;
         let config = crate::profiles::load(&ctx.config_dir)?;
@@ -155,9 +169,9 @@ pub fn set(ctx: &Ctx, slug: &str, key: &str, value: &str) -> Result<()> {
         let _lock = project.lock()?;
         project::write_atomic(&project.project_md(), edited.as_bytes())?;
     }
-    if key == "name" {
-        // The priming file names the project.
-        let _ = project::write_priming(&project, &crate::coordinator::current_prefix(&ctx.root)?);
+    if key == "name" || key.starts_with("coordinator_") {
+        // The priming files name the project and hold the coordinator profile's rules.
+        let _ = project::write_priming(&project, &crate::coordinator::current_prefix(&ctx.root)?, ctx.env, &ctx.config_dir);
     }
     println!("{slug}: {key} = {value}");
     Ok(())
@@ -195,7 +209,7 @@ pub fn is_text(path: &Path) -> bool {
 /// `open-file <path> [--workspace W]`: a text file opens in a new Herdr tab
 /// running `$EDITOR`; anything else with the system opener. No viewer.
 pub fn open_file(ctx: &Ctx, path: &Path, workspace: Option<&str>) -> Result<()> {
-    let path = std::fs::canonicalize(path).with_context(|| format!("{} does not exist", path.display()))?;
+    let path = crate::paths::canonicalize(path).with_context(|| format!("{} does not exist", path.display()))?;
     if path.is_dir() || !is_text(&path) {
         return system_open(ctx, &path.to_string_lossy());
     }
@@ -211,8 +225,11 @@ pub fn open_file(ctx: &Ctx, path: &Path, workspace: Option<&str>) -> Result<()> 
     }
     let created = herdr.call(&args, crate::herdr::CALL_TIMEOUT).map_err(|e| anyhow::anyhow!("{e}"))?;
     let pane = created["root_pane"]["pane_id"].as_str().context("herdr's tab reply has no pane")?.to_string();
-    let editor = ctx.env.var("VISUAL").or(ctx.env.var("EDITOR")).unwrap_or("vi");
-    let command = format!("{editor} {}", crate::remote::quote(&path.to_string_lossy()));
+    // The pane runs the user's shell: POSIX quoting there, and on Windows
+    // (PowerShell or cmd) double quotes, which a Windows path never contains.
+    let (default_editor, quoted) = if cfg!(windows) { ("notepad", format!("\"{}\"", path.display())) } else { ("vi", crate::remote::quote(&path.to_string_lossy())) };
+    let editor = ctx.env.var("VISUAL").or(ctx.env.var("EDITOR")).unwrap_or(default_editor);
+    let command = format!("{editor} {quoted}");
     // A fresh pane's shell needs a moment before it takes input.
     std::thread::sleep(std::time::Duration::from_millis(300));
     herdr.call(&["pane", "run", &pane, &command], crate::herdr::CALL_TIMEOUT).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -220,10 +237,17 @@ pub fn open_file(ctx: &Ctx, path: &Path, workspace: Option<&str>) -> Result<()> 
     Ok(())
 }
 
-/// A URL or a non-text file with the system opener (`open` / `xdg-open`).
+/// A URL or a non-text file with the system opener (`open` / `xdg-open`, and
+/// on Windows the shell's file-protocol handler, which exits 0 on success).
 pub fn system_open(ctx: &Ctx, target: &str) -> Result<()> {
-    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    let out = ctx.runner.run(&crate::runner::Cmd::new(opener, std::time::Duration::from_secs(10)).arg(target))?;
+    let (opener, args) = if cfg!(target_os = "macos") {
+        ("open", vec![target])
+    } else if cfg!(windows) {
+        ("rundll32", vec!["url.dll,FileProtocolHandler", target])
+    } else {
+        ("xdg-open", vec![target])
+    };
+    let out = ctx.runner.run(&crate::runner::Cmd::new(opener, std::time::Duration::from_secs(10)).args(args))?;
     if !out.success() {
         bail!("{opener} {target}: {}", out.error_text());
     }
@@ -267,6 +291,31 @@ mod tests {
         assert!(project::parse_project_md(&muted).unwrap().0.mute);
         let goal = set_in(MD, "goal", "Ship \"it\"").unwrap();
         assert_eq!(project::parse_project_md(&goal).unwrap().0.goal, "Ship \"it\"");
+        assert!(set_in(MD, "omp_profile", "neurable").is_err());
+    }
+
+    #[test]
+    fn a_legacy_omp_profile_reads_as_the_omp_defaults_profile_and_set_rewrites_it() {
+        let legacy = "+++\ncoordinator_agent = \"omp\"\nthread_agent = \"claude\"\nomp_profile = \"neurable\"\n+++\n";
+        let (settings, _) = project::parse_project_md(legacy).unwrap();
+        assert_eq!((settings.coordinator_profile.as_str(), settings.thread_profile.as_str()), ("omp-neurable", "claude"));
+        // Any `set` writes the migration out, so an explicit `omp` stays `omp`.
+        let edited = set_in(legacy, "thread_profile", "omp").unwrap();
+        assert_eq!(edited, "+++\ncoordinator_profile = \"omp-neurable\"\nthread_profile = \"omp\"\n+++\n");
+        assert_eq!(project::parse_project_md(&edited).unwrap().0.thread_profile, "omp");
+        // The default OMP profile changes nothing.
+        for value in ["", "default"] {
+            let text = legacy.replace("neurable", value);
+            assert_eq!(project::parse_project_md(&text).unwrap().0.coordinator_profile, "omp", "{value:?}");
+        }
+        // One OMP refuses names no profile, so the coordinator does not start
+        // under OMP's default profile, and `set` keeps it.
+        let bad = legacy.replace("neurable", "Neurable");
+        assert_eq!(project::parse_project_md(&bad).unwrap().0.coordinator_profile, "omp-Neurable");
+        let config = crate::profiles::Config::default();
+        let settings = project::parse_project_md(&bad).unwrap().0;
+        assert!(crate::profiles::resolve(&config, &project::Safety::default(), &settings, crate::profiles::Role::Coordinator, None, "demo").is_err());
+        assert!(set_in(&bad, "mute", "on").unwrap().contains("coordinator_profile = \"omp-Neurable\""));
     }
 
     #[test]

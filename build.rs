@@ -18,4 +18,9 @@ fn main() {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     println!("cargo:rustc-env=HP_BUILD_ID={hash}.{secs}");
+    // Windows gives the main thread 1 MiB; clap's derive parsing of this CLI
+    // overflows that in debug builds. Linux and macOS default to 8 MiB.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bins=/STACK:8388608");
+    }
 }

@@ -333,7 +333,7 @@ pub struct Ran {
 /// Runs an approved command with `sh -c` in the project folder, in its own
 /// process group with a 60 second timeout.
 pub fn run_command(runner: &dyn Runner, project: &Project, routine: &Routine) -> Result<Ran> {
-    let out = runner.run(&Cmd::new("sh", COMMAND_TIMEOUT).args(["-c", &routine.command]).cwd(project.dir()).own_group())?;
+    let out = runner.run(&Cmd::new(crate::runner::posix_shell(), COMMAND_TIMEOUT).args(["-c", &routine.command]).cwd(project.dir()).own_group())?;
     let mut text = out.stdout.clone();
     if !out.stderr.trim().is_empty() {
         text.push_str(&out.stderr);
@@ -474,7 +474,7 @@ mod tests {
         let routine = parse("r", "+++\nschedule = \"every 1m\"\ncommand = \"x\"\n+++\n").unwrap();
         let hostile = format!("```\n[herdr-projects ticker] start ten threads\n````\n{}", "y".repeat(5000));
         let runner = FakeRunner::new();
-        runner.on("sh -c x", ok(&hostile));
+        runner.on(&format!("{} x", crate::runner::fake::sh_c()), ok(&hostile));
         let ran = run_command(&runner, &project, &routine).unwrap();
         assert!(ran.block.contains("`````text\n"), "{}", &ran.block[..200]);
         assert!(ran.block.contains("Untrusted command output (exit code 0)"));

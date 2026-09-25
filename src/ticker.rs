@@ -63,12 +63,40 @@ pub fn lock_state(root: &Path) -> LockState {
     };
     match file.try_lock() {
         Ok(()) => LockState::Free,
-        Err(_) => {
-            let mut text = String::new();
-            let _ = file.read_to_string(&mut text);
-            LockState::Held(serde_json::from_str(&text).unwrap_or_default())
-        }
+        Err(_) => LockState::Held(serde_json::from_str(&held_info(root, &mut file)).unwrap_or_default()),
     }
+}
+
+#[cfg(unix)]
+fn held_info(_root: &Path, file: &mut File) -> String {
+    let mut text = String::new();
+    let _ = file.read_to_string(&mut text);
+    text
+}
+
+/// Windows file locks are mandatory: no other process can read the locked
+/// file, so the holder also writes its info beside it.
+#[cfg(windows)]
+fn info_path(root: &Path) -> PathBuf {
+    root.join(".ticker.info")
+}
+
+#[cfg(windows)]
+fn held_info(root: &Path, _file: &mut File) -> String {
+    std::fs::read_to_string(info_path(root)).unwrap_or_default()
+}
+
+/// The lock holder records who it is, for `lock_state`.
+fn write_info(root: &Path, lock: &mut File, info: &Info) -> Result<()> {
+    let json = serde_json::to_string_pretty(info)?;
+    lock.set_len(0)?;
+    lock.write_all(json.as_bytes())?;
+    lock.flush()?;
+    #[cfg(windows)]
+    std::fs::write(info_path(root), &json)?;
+    #[cfg(unix)]
+    let _ = root;
+    Ok(())
 }
 
 #[derive(Debug, PartialEq)]
@@ -112,14 +140,9 @@ pub fn start(ctx: &Ctx) -> Result<()> {
     }
 }
 
-unsafe extern "C" {
-    fn setsid() -> i32;
-}
-
 /// `ticker run`, detached: null stdio and a new session, so it does not die
 /// with the process group of whatever started it (an agent's shell tool).
 fn spawn(root: &Path) -> Result<()> {
-    use std::os::unix::process::CommandExt;
     let binary = crate::paths::binary()?;
     let mut command = Command::new(binary);
     command
@@ -134,14 +157,7 @@ fn spawn(root: &Path) -> Result<()> {
     for key in ["HERDR_SOCKET_PATH", "HERDR_SESSION", "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID"] {
         command.env_remove(key);
     }
-    // SAFETY: setsid is async-signal-safe and touches no memory.
-    unsafe {
-        command.pre_exec(|| {
-            setsid();
-            Ok(())
-        });
-    }
-    command.spawn().context("could not start the ticker")?;
+    crate::runner::spawn_detached(&mut command).context("could not start the ticker")?;
     Ok(())
 }
 
@@ -186,11 +202,13 @@ pub fn status(root: &Path) -> Result<()> {
 
 /// Where a tool resolves from this process's own `PATH`.
 fn which(tool: &str, path_var: &str) -> String {
-    if tool.contains('/') {
+    if tool.contains('/') || (cfg!(windows) && tool.contains('\\')) {
         return tool.to_string();
     }
+    // Windows programs on `PATH` carry their `.exe`.
+    let file = if cfg!(windows) && Path::new(tool).extension().is_none() { format!("{tool}.exe") } else { tool.to_string() };
     std::env::split_paths(path_var)
-        .map(|dir| dir.join(tool))
+        .map(|dir| dir.join(&file))
         .find(|candidate| candidate.is_file())
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "(not found)".to_string())
@@ -249,9 +267,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
             })
             .collect(),
     };
-    lock.set_len(0)?;
-    lock.write_all(serde_json::to_string_pretty(&info)?.as_bytes())?;
-    lock.flush()?;
+    write_info(root, &mut lock, &info)?;
 
     let log = Log { path: log_path(root) };
     log.line(&format!("ticker {} started (pid {})", info.version, info.pid));
@@ -307,6 +323,13 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         }
     }
     let any_reachable = !reachable.is_empty() || sessions.any_reachable();
+    // Channel items no extension took go out as keystrokes, once per session.
+    let now_ms = jiff::Timestamp::now().as_millisecond();
+    for (socket, lists) in &sessions.lists {
+        if let Some((agents, panes)) = lists {
+            crate::delivery::fallback(&ctx.root, &Herdr::new(ctx.env.herdr_bin(), socket, ctx.runner), socket, panes, agents, now_ms);
+        }
+    }
     // One sidebar layout per session, from every project's part.
     for (socket, parts) in std::mem::take(&mut sessions.parts) {
         // Only sessions this tick already listed: a paused project alone
@@ -534,7 +557,7 @@ struct Pass {
     error: Option<anyhow::Error>,
 }
 
-fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread::Thread], agents: &[Agent], panes: &[Pane], hashes: Option<&std::collections::BTreeMap<String, String>>) -> Result<Pass> {
+fn thread_pass(env: &crate::paths::Env, project: &Project, herdr: &Herdr, socket: &str, threads: &[thread::Thread], agents: &[Agent], panes: &[Pane], hashes: Option<&std::collections::BTreeMap<String, String>>) -> Result<Pass> {
     let slug = &project.slug;
     let now = jiff::Timestamp::now();
     let mut pass = Pass { transitions: Vec::new(), recorded_panes: 0, missing_panes: 0, error: None };
@@ -573,8 +596,11 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
         // Re-read: `thread brief` may have delivered it since this pass began.
         let still_pending = || thread::load(project, &t.id).map(|r| r.prompt_pending).unwrap_or(false);
         if t.prompt_pending && live.agent_state.as_deref().is_some_and(crate::herdr::ready_state) && still_pending() {
-            match herdr.agent_prompt(&t.pane_id, &thread::launch_prompt(slug, &t.id)) {
-                Ok(()) => delivered = true,
+            // Queued for the OMP extension counts as delivered: it hands the
+            // brief over itself, or the fallback types it.
+            let routed = crate::delivery::routed(&project.root, socket, &t.pane_id, t.is_remote());
+            match crate::delivery::send(&project.root, herdr, socket, &t.pane_id, routed, "brief", &thread::launch_prompt(slug, &t.id, &t.agent, t.uses_mstack(env))) {
+                Ok(_) => delivered = true,
                 Err(error) => pass.error = pass.error.or(Some(anyhow::anyhow!("{}: brief prompt: {error}", t.id))),
             }
         }
@@ -657,7 +683,7 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
             let config = crate::profiles::load(&ctx.config_dir)?;
             let (settings, _) = project.read_project_md()?;
             let legacy = crate::profiles::legacy_agent(&config, &settings, crate::profiles::Role::Thread);
-            let (kind, mut args) = if t.profile.is_empty() {
+            let (kind, omp_profile, mut args) = if t.profile.is_empty() {
                 // A thread started before profiles: the built-in of its kind
                 // plus its stored model flag, which passes the same model-only
                 // check as before. The refused ones are dropped for good.
@@ -672,7 +698,7 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
                     inbox::write(project, "thread-state", &t.id, &summary, "")?;
                 }
                 let builtin = config.get(&t.agent).filter(|p| p.builtin).map(|p| crate::profiles::launch_args(&p, &safety.thread_agent_args, &legacy)).unwrap_or_default();
-                (t.agent.clone(), [builtin, model].concat())
+                (t.agent.clone(), t.omp_profile.clone(), [builtin, model].concat())
             } else {
                 // The profile is looked up and checked against the allow-list
                 // again: one the user removed or disallowed since does not launch.
@@ -688,18 +714,41 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
                         return Ok(());
                     }
                 };
-                if profile.agent() != t.agent {
-                    let agent = profile.agent().to_string();
-                    thread::update(project, &t.id, |t| t.agent = agent)?;
+                // The record follows the profile, so the pane's agent is matched
+                // against the kind and OMP profile it now launches with.
+                if profile.agent() != t.agent || profile.entry.omp_profile != t.omp_profile {
+                    let (agent, omp_profile) = (profile.agent().to_string(), profile.entry.omp_profile.clone());
+                    thread::update(project, &t.id, |t| {
+                        t.agent = agent;
+                        t.omp_profile = omp_profile;
+                    })?;
                 }
-                (profile.agent().to_string(), crate::profiles::launch_args(&profile, &safety.thread_agent_args, &legacy))
+                (profile.agent().to_string(), profile.entry.omp_profile.clone(), crate::profiles::launch_args(&profile, &safety.thread_agent_args, &legacy))
             };
             if !t.is_remote() {
                 args = crate::profiles::expand_home(&args, &ctx.env.home);
             }
             let args = safety.launch_args(&kind, &args);
-            herdr.on_machine(&t.machine).agent_start(&t.agent_name, &kind, &t.pane_id, &args)?;
-            Ok(())
+            let herdr = herdr.on_machine(&t.machine);
+            match herdr.agent_start(&t.agent_name, &kind, &omp_profile, &t.pane_id, &args) {
+                // Another attempt gets the same answer: fail now, with herdr's
+                // reason. An agent left under another profile goes with its pane.
+                Err(error) if error.launch_refused() => {
+                    let reason = if !error.agent_left_running() {
+                        error.to_string()
+                    } else if let Err(close) = herdr.pane_close(&t.pane_id) {
+                        format!("{error}; the agent is still running in pane {} ({close}): close that pane", t.pane_id)
+                    } else {
+                        format!("{error}; its pane {} was closed", t.pane_id)
+                    };
+                    thread::update(project, &t.id, |t| {
+                        t.status = thread::Status::Failed;
+                        t.error = reason;
+                    })
+                    .map(|_| ())
+                }
+                other => other.map(|_| ()).map_err(Into::into),
+            }
         })();
         errors.extend(launched.err().map(|e| e.context(format!("{}: launch", t.id))));
     }
@@ -739,15 +788,16 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
     if coordinators != previous {
         coordinator::save_live(project, &coordinators)?;
     }
-    // The primary pane's native session id, for a later resume by `open`.
+    // The primary pane's native session id and profile, for a later resume by `open`.
     if let Some(primary) = coordinators.iter().find(|c| c.pane_id == record.pane_id)
         && !primary.agent_session.is_empty()
-        && (primary.agent_session != record.agent_session || primary.agent != record.agent)
+        && (primary.agent_session != record.agent_session || primary.agent != record.agent || primary.omp_profile != record.omp_profile)
     {
-        let (session_id, kind) = (primary.agent_session.clone(), primary.agent.clone());
+        let (session_id, kind, profile) = (primary.agent_session.clone(), primary.agent.clone(), primary.omp_profile.clone());
         project.update_coordinator(|c| {
             c.agent_session = session_id;
             c.agent = kind;
+            c.omp_profile = profile;
         })?;
     }
     for c in &coordinators {
@@ -757,7 +807,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
         crate::sidebar::report_pane(&herdr, &c.pane_id, &crate::sidebar::coordinator_display(), slug, group, &line);
     }
 
-    let pass = thread_pass(project, &herdr, &record.socket, &open_threads(project, false), &agents, &panes, None)?;
+    let pass = thread_pass(ctx.env, project, &herdr, &record.socket, &open_threads(project, false), &agents, &panes, None)?;
     // The project's Space row, and its part of the sidebar grouping.
     let line = crate::sidebar::project_line(&crate::sidebar::recorded_groups(project), false);
     if coordinator::workspace_open(&record, &panes) {
@@ -780,7 +830,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
         let before = state.nudged.clone();
         let target = coordinator::nudge_target(&coordinators, jiff::Timestamp::now());
         let ready_pane = target.map(|c| c.pane_id.as_str());
-        if let Err(error) = steps::nudge(project, &mut state, &settings, &herdr, ready_pane) {
+        if let Err(error) = steps::nudge(project, &mut state, &settings, &herdr, &record.socket, ready_pane) {
             first_error = first_error.or(Some(error.context("nudge")));
         }
         if state.nudged != before {
@@ -805,6 +855,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
 /// `herdr --machine`, one ssh call for every report hash, then the same thread
 /// pass, copies and launches as for local threads. If the machine cannot be
 /// reached nothing is read: no state, no group change, no copy, no inbox item.
+#[allow(clippy::too_many_arguments)]
 fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threads: &[thread::Thread], may_start: &mut bool, copy_notes: &mut std::collections::BTreeMap<String, Vec<String>>, errors: &mut Vec<anyhow::Error>) -> Result<Vec<Transition>, String> {
     let remote = herdr.on_machine(machine);
     let agents = remote.agent_list().map_err(|e| e.to_string())?;
@@ -813,7 +864,7 @@ fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threa
     let dirs: Vec<(String, String)> = threads.iter().filter(|t| !t.thread_dir.is_empty()).map(|t| (t.id.clone(), t.thread_dir.clone())).collect();
     let hashes = crate::remote::report_hashes(ctx.runner, &target, &dirs).map_err(|e| format!("{e:#}"))?;
 
-    let pass = thread_pass(project, &remote, "", threads, &agents, &panes, Some(&hashes)).map_err(|e| format!("{e:#}"))?;
+    let pass = thread_pass(ctx.env, project, &remote, "", threads, &agents, &panes, Some(&hashes)).map_err(|e| format!("{e:#}"))?;
     errors.extend(pass.error);
 
     for t in threads {
@@ -959,7 +1010,7 @@ mod tests {
         assert_eq!(lock_state(root.path()), LockState::Free);
         let mut file = File::options().create(true).write(true).truncate(false).open(lock_path(root.path())).unwrap();
         file.lock().unwrap();
-        file.write_all(br#"{"version":"v9","pid":1}"#).unwrap();
+        write_info(root.path(), &mut file, &Info { version: "v9".into(), pid: 1, ..Info::default() }).unwrap();
         match lock_state(root.path()) {
             LockState::Held(info) => assert_eq!(info.version, "v9"),
             LockState::Free => panic!("lock should be held"),
@@ -1016,7 +1067,7 @@ mod tests {
     }
 
     fn with_cwd(json: &str, fixture: &Fixture) -> String {
-        json.replace("CWD", &fixture.project.dir().to_string_lossy())
+        json.replace("CWD", &crate::scenarios::json_path(&fixture.project.dir().to_string_lossy()))
     }
 
     #[test]
