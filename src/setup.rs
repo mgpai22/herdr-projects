@@ -95,12 +95,24 @@ fn remove_ours(kind: &str, text: &str, command: Option<&str>) -> Result<String> 
 }
 
 /// Herdr's config file: `HERDR_CONFIG_PATH`, else `$XDG_CONFIG_HOME/herdr`,
-/// else `~/.config/herdr/config.toml`.
+/// else herdr's platform config dir (`~/.config/herdr`, or `%APPDATA%\herdr`
+/// on Windows, as herdr's own `config::io::config_dir`).
 pub fn herdr_config_path(env: &Env) -> PathBuf {
     if let Some(path) = env.var("HERDR_CONFIG_PATH") {
         return PathBuf::from(path);
     }
-    env.var("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| env.home.join(".config")).join("herdr/config.toml")
+    herdr_config_dir(env).join("config.toml")
+}
+
+pub fn herdr_config_dir(env: &Env) -> PathBuf {
+    if let Some(dir) = env.var("XDG_CONFIG_HOME") {
+        return PathBuf::from(dir).join("herdr");
+    }
+    #[cfg(windows)]
+    if let Some(dir) = env.var("APPDATA") {
+        return PathBuf::from(dir).join("herdr");
+    }
+    env.home.join(".config").join("herdr")
 }
 
 /// The tab-bar command: absolute paths, since it runs under `/bin/sh -lc` on
@@ -695,6 +707,19 @@ mod tests {
     use super::*;
 
     const CMD: &str = "'/p/herdr-projects' --root /r hook --agent claude 2>/dev/null || true";
+
+    #[test]
+    fn herdr_config_follows_herdr_own_lookup() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        let with = |vars: &[(&str, &str)]| herdr_config_path(&Env::for_test(h, vars));
+        assert_eq!(with(&[("HERDR_CONFIG_PATH", "/x/c.toml"), ("XDG_CONFIG_HOME", "/xdg")]), PathBuf::from("/x/c.toml"));
+        assert_eq!(with(&[("XDG_CONFIG_HOME", "/xdg"), ("APPDATA", "/appdata")]), PathBuf::from("/xdg").join("herdr").join("config.toml"));
+        #[cfg(windows)]
+        assert_eq!(with(&[("APPDATA", "/appdata")]), PathBuf::from("/appdata").join("herdr").join("config.toml"));
+        #[cfg(not(windows))]
+        assert_eq!(with(&[("APPDATA", "/appdata")]), h.join(".config").join("herdr").join("config.toml"));
+    }
 
     #[test]
     fn the_hook_command_never_fails_even_with_a_missing_binary() {

@@ -191,7 +191,7 @@ pub fn resolve_session(flags: &SessionFlags, env: &Env, runner: &dyn Runner) -> 
         .into_iter()
         .find(|s| s.default)
         .map(|s| s.socket_path)
-        .unwrap_or_else(|| env.home.join(".config/herdr/herdr.sock"));
+        .unwrap_or_else(|| crate::setup::herdr_config_dir(env).join("herdr.sock"));
     Ok(Session { socket, name: None })
 }
 
