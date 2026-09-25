@@ -121,7 +121,7 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         // A remote path is stored as it is on its own machine.
         (Some(repo), false) => repo.clone(),
         (Some(repo), true) => {
-            let path = std::fs::canonicalize(repo)
+            let path = crate::paths::canonicalize(repo)
                 .with_context(|| format!("repository {repo} does not exist"))?
                 .to_string_lossy()
                 .into_owned();
@@ -152,6 +152,7 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         t.machine = machine.clone();
         t.agent = profile.agent().to_string();
         t.profile = profile.name.clone();
+        t.omp_profile = profile.entry.omp_profile.clone();
         t.base = args.base.clone().unwrap_or_default();
     })?;
     let id = record.id.clone();
@@ -282,7 +283,7 @@ fn place_tab(project: &Project, view: &SessionView, record: &Thread) -> Result<T
         }
         folder
     };
-    let folder = std::fs::canonicalize(&folder)?;
+    let folder = crate::paths::canonicalize(&folder)?;
     let created = match workspace {
         Some(id) => view.herdr.tab_create(&id, &folder, &record.title, false)?,
         // The coordinator runs in a pane of another workspace: the thread
@@ -423,16 +424,19 @@ fn lists_for(view: &SessionView, record: &Thread) -> Result<(Vec<Agent>, Vec<Pan
 /// worktree or a new tab, with the same or another profile.
 pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result<Thread> {
     let project = Project::load(&ctx.root, slug)?;
-    if let Some(name) = profile {
-        let profile = crate::profiles::for_project(ctx, &project, crate::profiles::Role::Thread, Some(name))?;
-        // The profile carries the whole setup: old model flags no longer apply.
-        thread::update(&project, id, |t| {
+    let profile = profile.map(|name| crate::profiles::for_project(ctx, &project, crate::profiles::Role::Thread, Some(name))).transpose()?;
+    let change = |t: &mut Thread| {
+        if let Some(profile) = &profile {
+            // The profile carries the whole setup: old model flags no longer apply.
             t.agent = profile.agent().to_string();
             t.profile = profile.name.clone();
+            t.omp_profile = profile.entry.omp_profile.clone();
             t.agent_args.clear();
-        })?;
-    }
-    let record = thread::load(&project, id)?;
+        }
+    };
+    // The refusals below run on a copy: a refused restart changes nothing.
+    let mut record = thread::load(&project, id)?;
+    change(&mut record);
     ticker::start(ctx)?;
     let view = require_session(ctx, &project)?;
     let (agents, panes) = lists_for(&view, &record)?;
@@ -448,7 +452,9 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result
         }
     };
 
-    match restart_plan(&record, &live, branch_exists, now)? {
+    let plan = restart_plan(&record, &live, branch_exists, now)?;
+    thread::update(&project, id, change)?;
+    match plan {
         RestartPlan::Create => return place_and_brief(ctx, &project, &view, id, true),
         RestartPlan::ReusePane => {}
         RestartPlan::Reopen => match record.kind {
@@ -477,8 +483,9 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, profile: Option<&str>) -> Result
 }
 
 /// Sends a follow-up. The one sender that does not use the ready-for-a-prompt
-/// predicate: agents queue a message that arrives while they work.
-pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
+/// predicate: agents queue a message that arrives while they work. Returns
+/// the agent's state and how the text went out.
+pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<(String, crate::delivery::Sent)> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
     if text.trim().is_empty() {
@@ -492,15 +499,14 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<String> {
     }
     let view = require_session(ctx, &project)?;
     let (agents, _) = lists_for(&view, &record)?;
-    let state = prompt_state(&record, &agents)?;
-    view.herdr
-        .on_machine(&record.machine)
-        .agent_prompt(&record.pane_id, text.trim())
+    let routed = crate::delivery::routed(&ctx.root, &view.socket, &record.pane_id, record.is_remote());
+    let state = prompt_state(&record, &agents, routed)?;
+    let sent = crate::delivery::send(&ctx.root, &view.herdr.on_machine(&record.machine), &view.socket, &record.pane_id, routed, "follow-up", text.trim())
         .map_err(|error| anyhow::anyhow!("{error}"))?;
-    // Written after the send, so the task file never claims a prompt that was
-    // refused; a restarted thread re-reads it with its task.
+    // Written after the send (or the queueing), so the task file never claims
+    // a prompt that was refused; a restarted thread re-reads it with its task.
     thread::append_follow_up(&project, id, text)?;
-    Ok(state)
+    Ok((state, sent))
 }
 
 /// `thread next`: forward line N of the thread's Next list as a prompt, or add
@@ -534,8 +540,9 @@ pub fn next(ctx: &Ctx, slug: &str, id: &str, line: Option<usize>, add: Option<&s
         }
         Some(n) => {
             let text = lines.get(n.wrapping_sub(1)).with_context(|| format!("{id} has no Next line {n} ({} lines)", lines.len()))?;
-            let state = prompt(ctx, slug, id, text)?;
-            println!("sent Next line {n} to {id} (agent was {state}): {text}");
+            let (state, sent) = prompt(ctx, slug, id, text)?;
+            let verb = if sent == crate::delivery::Sent::Queued { "queued" } else { "sent" };
+            println!("{verb} Next line {n} to {id} (agent was {state}): {text}");
             Ok(())
         }
     }
@@ -563,6 +570,7 @@ pub fn stop(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
 struct PaneAgent<'a> {
     record: Thread,
     herdr: Herdr<'a>,
+    socket: String,
     state: String,
 }
 
@@ -580,7 +588,7 @@ fn pane_agent<'a>(ctx: &'a Ctx, slug: &str, id: &str) -> Result<PaneAgent<'a>> {
         .map(|a| a.agent_status.clone())
         .with_context(|| format!("no agent is detected in {id}'s pane; nothing is read from or typed at a bare shell (try `thread restart`)"))?;
     let herdr = view.herdr.on_machine(&record.machine);
-    Ok(PaneAgent { record, herdr, state })
+    Ok(PaneAgent { record, herdr, socket: view.socket, state })
 }
 
 /// `thread read`: what the thread's pane shows now (a trust dialog, a question
@@ -624,6 +632,8 @@ pub fn keys(ctx: &Ctx, slug: &str, id: &str, keys: &[String], text: Option<&str>
 /// `thread brief`: delivers a thread's brief now instead of on the ticker's
 /// next pass (it only prompts an agent a tick after starting it). The record
 /// is claimed under the project lock first, so the ticker does not send it too.
+/// Like the ticker's, it goes through the channel: an OMP pane whose
+/// extension is alive gets it queued.
 pub fn brief(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
@@ -649,22 +659,30 @@ pub fn brief(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
         println!("{id} got its brief from the ticker just now");
         return Ok(());
     }
-    if let Err(error) = pane.herdr.agent_prompt(&pane.record.pane_id, &thread::launch_prompt(slug, id)) {
-        thread::update(&project, id, |t| t.prompt_pending = true)?;
-        bail!("{error}");
-    }
-    println!("sent {id} its brief (agent was {})", pane.state);
+    let routed = crate::delivery::routed(&ctx.root, &pane.socket, &pane.record.pane_id, pane.record.is_remote());
+    let prompt = thread::launch_prompt(slug, id, &pane.record.agent, pane.record.uses_mstack(ctx.env));
+    let sent = match crate::delivery::send(&ctx.root, &pane.herdr, &pane.socket, &pane.record.pane_id, routed, "brief", &prompt) {
+        Ok(sent) => sent,
+        Err(error) => {
+            thread::update(&project, id, |t| t.prompt_pending = true)?;
+            bail!("{error}");
+        }
+    };
+    let how = if sent == crate::delivery::Sent::Queued { "queued" } else { "sent" };
+    println!("{how} {id} its brief (agent was {})", pane.state);
     Ok(())
 }
 
-/// The state a follow-up may be sent in, or the refusal.
-pub fn prompt_state(record: &Thread, agents: &[Agent]) -> Result<String> {
+/// The state a follow-up may be sent in, or the refusal. A blocked agent
+/// takes one only when it is `routed` to the OMP extension, which queues it
+/// behind the question without touching the input box.
+pub fn prompt_state(record: &Thread, agents: &[Agent], routed: bool) -> Result<String> {
     let agent = agents
         .iter()
         .find(|a| thread::agent_matches(record, a))
         .with_context(|| format!("no agent is detected in {}'s pane; text is never typed at a bare shell prompt (try `thread restart`)", record.id))?;
     match agent.agent_status.as_str() {
-        "blocked" => bail!(
+        "blocked" if !routed => bail!(
             "agent_blocked: {} is waiting on a prompt in its pane ({}); `thread read` shows it, `thread keys` answers it",
             record.id,
             record.pane_id
@@ -1128,11 +1146,12 @@ mod tests {
     #[test]
     fn prompt_refusals_and_sending_while_working() {
         let t = Thread { agent_name: String::new(), kind: Kind::Adopted, ..worktree_thread() };
-        assert!(prompt_state(&t, &[]).unwrap_err().to_string().contains("bare shell prompt"));
-        assert!(prompt_state(&t, &[agent("unknown")]).is_err());
-        assert!(prompt_state(&t, &[agent("blocked")]).unwrap_err().to_string().contains("agent_blocked"));
-        assert_eq!(prompt_state(&t, &[agent("working")]).unwrap(), "working");
-        assert_eq!(prompt_state(&t, &[agent("idle")]).unwrap(), "idle");
+        assert!(prompt_state(&t, &[], true).unwrap_err().to_string().contains("bare shell prompt"));
+        assert!(prompt_state(&t, &[agent("unknown")], true).is_err());
+        assert!(prompt_state(&t, &[agent("blocked")], false).unwrap_err().to_string().contains("agent_blocked"));
+        assert_eq!(prompt_state(&t, &[agent("blocked")], true).unwrap(), "blocked");
+        assert_eq!(prompt_state(&t, &[agent("working")], false).unwrap(), "working");
+        assert_eq!(prompt_state(&t, &[agent("idle")], false).unwrap(), "idle");
     }
 
     #[test]

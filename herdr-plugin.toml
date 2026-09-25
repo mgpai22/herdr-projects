@@ -1,13 +1,24 @@
 id = "herdr-projects"
 name = "Projects"
-version = "0.2.18"
+version = "0.2.18-omp.1"
 min_herdr_version = "0.9.1"
 description = "A coordinator conversation, parallel worker threads, shared memory and an overview of what needs you."
-platforms = ["macos", "linux"]
+platforms = ["macos", "linux", "windows"]
+
+# Commands name target/release/herdr-projects without `.exe`: herdr joins the
+# plugin root, and on Windows both of its launchers add `.exe` to an
+# extensionless path (Rust's `Command` for actions and startup, portable-pty's
+# PATHEXT search for panes).
 
 [[build]]
 # Downloads the release binary; falls back to `cargo build --release --locked`.
+platforms = ["macos", "linux"]
 command = ["sh", "scripts/install.sh"]
+
+[[build]]
+# No Windows release binaries: `cargo build --release --locked` into target\.
+platforms = ["windows"]
+command = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "scripts/install.ps1"]
 
 [[startup]]
 command = ["target/release/herdr-projects", "startup"]
@@ -62,7 +73,7 @@ command = ["target/release/herdr-projects", "action", "resume"]
 
 [[actions]]
 id = "configure"
-title = "Projects: set up the sidebar, popup key, progress hooks and skill"
+title = "Projects: set up the sidebar, popup key, progress hooks, OMP extension and skill"
 contexts = ["workspace"]
 command = ["target/release/herdr-projects", "action", "configure"]
 

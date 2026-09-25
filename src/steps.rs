@@ -246,7 +246,7 @@ fn hash_ids(ids: &BTreeSet<String>) -> String {
 /// of a prompt in the coordinator; with no live coordinator the same.
 /// `coordinator_ready` is the pane of a coordinator idle long enough to be
 /// prompted (see `coordinator::nudge_target`).
-pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &Herdr, coordinator_ready: Option<&str>) -> Result<()> {
+pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &Herdr, socket: &str, coordinator_ready: Option<&str>) -> Result<()> {
     let seen = inbox::seen(project);
     let unseen: BTreeSet<String> = inbox::unhandled(project).into_iter().map(|i| i.id).filter(|id| !seen.contains(id)).collect();
     if unseen.is_empty() {
@@ -265,8 +265,10 @@ pub fn nudge(project: &Project, state: &mut State, settings: &Settings, herdr: &
             return Ok(()); // not idle long enough: try again on a later tick
         };
         // `agent_blocked` and other errors are returned, logged by the caller,
-        // and the nudge is retried on a later tick.
-        herdr.agent_prompt(pane, NUDGE_TEXT)?;
+        // and the nudge is retried on a later tick. Queued for the OMP
+        // extension counts as announced.
+        let routed = crate::delivery::routed(&project.root, socket, pane, false);
+        crate::delivery::send(&project.root, herdr, socket, pane, routed, "nudge", NUDGE_TEXT)?;
     }
     state.nudged = hash;
     Ok(())
@@ -451,7 +453,7 @@ fn fire_pr_routines(ctx: &Ctx, project: &Project, t: &Thread, url: &str, events:
         }
         let prompt = pr_routine_prompt(&r.name, &r.prompt, url, &hit, summary);
         let outcome = match threads::prompt(ctx, &project.slug, &t.id, &prompt) {
-            Ok(state) => format!("prompted {} (agent was {state}) about: {}", t.id, hit.join(", ")),
+            Ok((state, _)) => format!("prompted {} (agent was {state}) about: {}", t.id, hit.join(", ")),
             Err(error) => format!("could not prompt {} about {}: {error:#}", t.id, hit.join(", ")),
         };
         errors.extend(inbox::write(project, "routine", &r.name, &format!("routine `{}` {outcome}", r.name), "").err());

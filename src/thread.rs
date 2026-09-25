@@ -1,6 +1,7 @@
 //! Thread records, ids, briefs, groups and the copy home.
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -9,7 +10,9 @@ use sha2::{Digest, Sha256};
 
 use crate::herdr::{Agent, Pane, ready_state};
 use crate::project::{self, Project, slugify, write_atomic};
-use crate::runner::{Cmd, Runner};
+#[cfg(unix)]
+use crate::runner::Cmd;
+use crate::runner::Runner;
 
 pub const STARTING_TIMEOUT_SECS: i64 = 300;
 pub const BLOCKED_DEBOUNCE_SECS: i64 = 30;
@@ -82,6 +85,9 @@ pub struct Thread {
     /// project's allow-list again at every launch. Empty on a thread started
     /// before profiles: it launches as the built-in `agent` plus `agent_args`.
     pub profile: String,
+    /// The OMP profile herdr launches the agent with (the profile's
+    /// `omp_profile`, resolved at start); empty = default.
+    pub omp_profile: String,
     /// Before profiles: a model flag for the agent CLI (checked again by the
     /// ticker). New threads leave it empty.
     pub agent_args: Vec<String>,
@@ -112,6 +118,19 @@ pub struct Thread {
 impl Thread {
     pub fn is_remote(&self) -> bool {
         !self.machine.is_empty()
+    }
+
+    /// The profile the thread runs: before profiles (and when adopted), the
+    /// built-in of its kind and OMP profile, as `coordinator::found_profile`.
+    pub fn profile_name(&self) -> String {
+        if self.profile.is_empty() { crate::coordinator::found_profile(&self.agent, &self.omp_profile) } else { self.profile.clone() }
+    }
+
+    /// True when the thread's launch prompt routes through mstack: a local OMP
+    /// thread whose profile has mstack installed and enabled. A remote
+    /// machine's plugins cannot be read from here, so remote threads keep workflowz.
+    pub fn uses_mstack(&self, env: &crate::paths::Env) -> bool {
+        !self.is_remote() && self.agent == "omp" && crate::omp::mstack_version(env, &self.omp_profile).is_some()
     }
 
     pub fn report_path(&self) -> String {
@@ -287,9 +306,18 @@ pub fn thread_dir(cwd: &str, slug: &str, id: &str) -> String {
 }
 
 /// The one line the agent is prompted with; the relative path is the same for
-/// every kind. Nothing from outside is ever placed in a prompt.
-pub fn launch_prompt(slug: &str, id: &str) -> String {
-    format!("Read .herdr-project/{slug}-{id}/brief.md and do what it says.")
+/// every kind. Nothing from outside is ever placed in a prompt. OMP turns on
+/// its workflow notice only for the bare word in a user prompt (not in the
+/// brief file, not in backticks), so an OMP thread gets it here; with mstack
+/// the prompt names its router instead. No push or PR words: mstack refuses
+/// external effects asked for in the prompt itself.
+pub fn launch_prompt(slug: &str, id: &str, agent: &str, mstack: bool) -> String {
+    let workflow = match (agent, mstack) {
+        ("omp", true) => " Route the task with skill://mstack-mode; if no playbook fits, use skill://mstack-figure-it-out.",
+        ("omp", false) => " Use workflowz for multi-slice work.",
+        _ => "",
+    };
+    format!("Read .herdr-project/{slug}-{id}/brief.md and do what it says.{workflow}")
 }
 
 // ---------------------------------------------------------------- briefs
@@ -377,7 +405,7 @@ pub fn compose_brief(input: &BriefInput) -> String {
     if input.report_prefix.is_empty() {
         brief.push_str("Report progress with `herdr-projects report --percent N --activity '...'` if that command exists on this machine (use `--activity 'Waiting for you'` before asking the user something, and `--percent 100` when done); otherwise skip it.\n");
     } else {
-        brief.push_str(&format!("Report progress in this pane with `{} report --percent N --activity '...'` (two to four words; `--unknown` while the scope is unclear): at the start, at milestones, about once a minute while working, `--activity 'Waiting for you'` before asking the user something, and `--percent 100` when the whole task is done.\n", input.report_prefix));
+        brief.push_str(&format!("Report progress in this pane with `{} report --percent N --activity '...'` (two to four words; `--unknown` while the scope is unclear): at the start, at milestones, about once a minute while working, `--activity 'Waiting for you'` before asking the user something, and `--percent 100` when the whole task is done. If you keep a todo list, your harness may report progress from it automatically; `report` still wins for anything the list does not show.\n", input.report_prefix));
     }
     brief.push_str("\n# Task\n\n");
     brief.push_str(input.task.trim());
@@ -837,13 +865,7 @@ pub fn copy_home_remote(project: &Project, thread: &Thread, with_library: bool, 
 }
 
 fn copy_library_local(project: &Project, thread: &Thread, library: &Path, runner: &dyn Runner) -> Result<Vec<String>> {
-    let du = runner.run(&Cmd::new("du", Duration::from_secs(10)).args(["-sk", &library.to_string_lossy()]))?;
-    let kb: u64 = du
-        .stdout
-        .split_whitespace()
-        .next()
-        .and_then(|n| n.parse().ok())
-        .context("could not measure the library folder")?;
+    let kb = library_kb(library, runner)?;
     if kb > LIBRARY_CAP_KB {
         return Ok(vec![format!(
             "the library is {} MB, over the {} MB cap; nothing from it was copied",
@@ -863,6 +885,22 @@ fn copy_library_local(project: &Project, thread: &Thread, library: &Path, runner
             std::fs::create_dir(&target).with_context(|| format!("could not create {}", target.display()))?;
         }
     }
+    copy_tree(library, &target, runner)?;
+    Ok(notes)
+}
+
+#[cfg(unix)]
+fn library_kb(library: &Path, runner: &dyn Runner) -> Result<u64> {
+    let du = runner.run(&Cmd::new("du", Duration::from_secs(10)).args(["-sk", &library.to_string_lossy()]))?;
+    du.stdout
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .context("could not measure the library folder")
+}
+
+#[cfg(unix)]
+fn copy_tree(library: &Path, target: &Path, runner: &dyn Runner) -> Result<()> {
     // `-rt` without `-l`: symbolic links are skipped, never followed.
     let out = runner.run(
         &Cmd::new("rsync", Duration::from_secs(60)).args([
@@ -874,7 +912,54 @@ fn copy_library_local(project: &Project, thread: &Thread, library: &Path, runner
     if !out.success() {
         bail!("rsync failed: {}", out.error_text());
     }
-    Ok(notes)
+    Ok(())
+}
+
+/// Windows has neither `du` nor `rsync`: the regular files under `dir`, in
+/// kilobytes, never following a link.
+#[cfg(windows)]
+fn library_kb(dir: &Path, _runner: &dyn Runner) -> Result<u64> {
+    fn bytes(dir: &Path) -> std::io::Result<u64> {
+        let mut total = 0;
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            let meta = std::fs::symlink_metadata(&path)?;
+            if meta.is_dir() {
+                total += bytes(&path)?;
+            } else if meta.is_file() {
+                total += meta.len();
+            }
+        }
+        Ok(total)
+    }
+    Ok(bytes(dir).context("could not measure the library folder")?.div_ceil(1024))
+}
+
+/// `rsync -rt` in process: directories and regular files (`CopyFileExW`
+/// keeps modification times); symbolic links and junctions are skipped.
+#[cfg(windows)]
+fn copy_tree(from: &Path, to: &Path, _runner: &dyn Runner) -> Result<()> {
+    fn copy(from: &Path, to: &Path) -> Result<()> {
+        for entry in std::fs::read_dir(from).with_context(|| format!("could not read {}", from.display()))? {
+            let path = entry?.path();
+            let meta = std::fs::symlink_metadata(&path)?;
+            let dest = to.join(path.file_name().context("library entry has no name")?);
+            if meta.is_dir() {
+                // Never `create_dir_all`: the walk is top-down, so a missing
+                // parent means the project was deleted meanwhile; fail as rsync does.
+                if let Err(e) = std::fs::create_dir(&dest)
+                    && e.kind() != std::io::ErrorKind::AlreadyExists
+                {
+                    return Err(e).with_context(|| format!("could not create {}", dest.display()));
+                }
+                copy(&path, &dest)?;
+            } else if meta.is_file() {
+                std::fs::copy(&path, &dest).with_context(|| format!("could not copy {}", path.display()))?;
+            }
+        }
+        Ok(())
+    }
+    copy(from, to)
 }
 
 #[cfg(test)]
@@ -1096,7 +1181,16 @@ mod tests {
         assert_eq!(branch_name("demo", "t-0001", "Fix the $(login) bug!"), "hp/demo/t-0001-fix-the-login-bug");
         assert_eq!(branch_name("demo", "t-0002", "???"), "hp/demo/t-0002");
         assert_eq!(thread_dir("/wt/", "demo", "t-0001"), "/wt/.herdr-project/demo-t-0001");
-        assert_eq!(launch_prompt("demo", "t-0001"), "Read .herdr-project/demo-t-0001/brief.md and do what it says.");
+        assert_eq!(launch_prompt("demo", "t-0001", "claude", false), "Read .herdr-project/demo-t-0001/brief.md and do what it says.");
+        assert_eq!(launch_prompt("demo", "t-0001", "claude", true), launch_prompt("demo", "t-0001", "claude", false));
+        let omp = launch_prompt("demo", "t-0001", "omp", false);
+        assert!(omp.starts_with("Read .herdr-project/demo-t-0001/brief.md and do what it says. "), "{omp}");
+        // OMP's keyword needs the bare word as prose: no backticks around it.
+        assert!(omp.split_whitespace().any(|w| w == "workflowz") && !omp.contains('`'), "{omp}");
+        assert_eq!(
+            launch_prompt("demo", "t-0001", "omp", true),
+            "Read .herdr-project/demo-t-0001/brief.md and do what it says. Route the task with skill://mstack-mode; if no playbook fits, use skill://mstack-figure-it-out."
+        );
     }
 
     #[test]
@@ -1234,7 +1328,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(home_report_path(&project, &t.id)).unwrap(), "## Report\nok\n");
         assert_eq!(std::fs::read_to_string(project.dir().join("library/t-0001/out.txt")).unwrap(), "data");
 
-        std::os::unix::fs::symlink("/etc/passwd", dir.join("library/link")).unwrap();
+        crate::setup::file_link("/etc/passwd", dir.join("library/link"));
         let copied = copy_home_local(&project, &t, true, &RealRunner);
         assert!(matches!(copied.outcome, CopyOutcome::Partial(_)));
         assert!(!project.dir().join("library/t-0001/link").exists());
@@ -1248,8 +1342,8 @@ mod tests {
         let dir = work.path().join(".herdr-project/demo-t-0001");
         let t = local_thread(&project, &dir);
         std::fs::remove_dir(dir.join("library")).unwrap();
-        std::os::unix::fs::symlink("/etc", dir.join("library")).unwrap();
-        std::os::unix::fs::symlink("/etc/passwd", dir.join("report.md")).unwrap();
+        crate::setup::link_dir(&std::env::temp_dir(), &dir.join("library")).unwrap();
+        crate::setup::file_link("/etc/passwd", dir.join("report.md"));
         let copied = copy_home_local(&project, &t, true, &RealRunner);
         match copied.outcome {
             CopyOutcome::Partial(notes) => assert_eq!(notes.len(), 2, "{notes:?}"),
@@ -1263,13 +1357,14 @@ mod tests {
         std::fs::create_dir(&real).unwrap();
         std::fs::write(real.join("report.md"), "secret").unwrap();
         let linked = work.path().join("linked");
-        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        crate::setup::link_dir(&real, &linked).unwrap();
         let t2 = allocate(&project, |t| t.thread_dir = linked.to_string_lossy().into_owned()).unwrap();
         let copied = copy_home_local(&project, &t2, true, &RealRunner);
         assert!(matches!(copied.outcome, CopyOutcome::Partial(_)));
         assert!(!home_report_path(&project, &t2.id).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn library_over_the_cap_is_not_copied() {
         use crate::runner::fake::{FakeRunner, ok};
@@ -1287,6 +1382,56 @@ mod tests {
         assert!(home_report_path(&project, &t.id).is_file());
     }
 
+    /// Windows measures and copies in process: a library past the cap by
+    /// size, nested folders copied, links left out.
+    #[cfg(windows)]
+    #[test]
+    fn windows_library_copy_measures_nests_and_caps() {
+        use crate::runner::fake::FakeRunner;
+        let root = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let dir = work.path().join(".herdr-project/demo-t-0001");
+        let t = local_thread(&project, &dir);
+        std::fs::create_dir_all(dir.join("library/sub/deeper")).unwrap();
+        std::fs::write(dir.join("library/sub/deeper/a.txt"), "deep").unwrap();
+        crate::setup::link_dir(work.path(), &dir.join("library/sub/loop")).unwrap();
+        let runner = FakeRunner::new();
+        let copied = copy_home_local(&project, &t, true, &runner);
+        assert!(matches!(&copied.outcome, CopyOutcome::Partial(notes) if notes.len() == 1 && notes[0].contains("loop")), "{:?}", copied.outcome);
+        assert_eq!(std::fs::read_to_string(project.dir().join("library/t-0001/sub/deeper/a.txt")).unwrap(), "deep");
+        assert!(std::fs::symlink_metadata(project.dir().join("library/t-0001/sub/loop")).is_err());
+        assert!(runner.calls.borrow().is_empty(), "no du or rsync on Windows");
+
+        let big = std::fs::File::create(dir.join("library/big.bin")).unwrap();
+        big.set_len((LIBRARY_CAP_KB + 1) * 1024).unwrap();
+        let copied = copy_home_local(&project, &t, true, &runner);
+        assert!(matches!(&copied.outcome, CopyOutcome::Partial(notes) if notes[0].contains("over the 50 MB cap")), "{:?}", copied.outcome);
+        assert!(!project.dir().join("library/t-0001/big.bin").exists());
+    }
+
+    /// A project deleted while its library copy runs is not rebuilt as a bare
+    /// folder tree: the copy fails, as rsync does on Unix.
+    #[cfg(windows)]
+    #[test]
+    fn windows_library_copy_never_recreates_a_deleted_target() {
+        use crate::runner::fake::FakeRunner;
+        let work = tempfile::tempdir().unwrap();
+        let library = work.path().join("library");
+        std::fs::create_dir_all(library.join("sub/deeper")).unwrap();
+        let gone = work.path().join("gone");
+        assert!(copy_tree(&library, &gone.join("library/t-0001"), &FakeRunner::new()).is_err());
+        assert!(!gone.exists(), "the deleted project's folders were recreated");
+
+        // An existing target, copied twice: folders already there are fine.
+        let target = work.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        copy_tree(&library, &target, &FakeRunner::new()).unwrap();
+        copy_tree(&library, &target, &FakeRunner::new()).unwrap();
+        assert!(target.join("sub/deeper").is_dir());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn failed_rsync_is_a_failed_copy() {
         use crate::runner::fake::{FakeRunner, fail, ok};

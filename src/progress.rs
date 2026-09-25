@@ -19,6 +19,10 @@ pub const ACTIVITY_TTL_MS: u64 = 300_000;
 pub const REMIND_SECS: i64 = 60;
 pub const WAITING: &str = "Waiting for you";
 pub const DONE: &str = "Done";
+/// The OMP extension pulls its channel every two seconds; five missed pulls
+/// and queued prompts go back to keystrokes.
+pub const CHANNEL_FRESH_SECS: i64 = 10;
+pub const CHANNEL_OMP: &str = "omp-ext";
 
 /// One pane's self-report.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -37,6 +41,10 @@ pub struct Record {
     /// Unix seconds of the last reminder the hook injected.
     pub reminded_at: i64,
     pub session_started_at: i64,
+    /// `omp-ext` while the OMP extension pulls this pane's prompt channel.
+    pub channel: String,
+    /// Unix seconds of the last `channel pull`; 0 when never.
+    pub channel_seen: i64,
 }
 
 impl Record {
@@ -61,10 +69,14 @@ pub fn dir(root: &Path) -> PathBuf {
     root.join(".progress")
 }
 
-/// `<pane id>-<short hash of the socket path>.json`: pane ids repeat across sessions.
-pub fn path(root: &Path, socket: &str, pane_id: &str) -> PathBuf {
+/// `<pane id>-<short hash of the socket path>`: pane ids repeat across sessions.
+pub fn record_stem(socket: &str, pane_id: &str) -> String {
     let hash = &crate::thread::sha256_hex(socket.as_bytes())[..8];
-    dir(root).join(format!("{}-{hash}.json", pane_id.replace(':', "_")))
+    format!("{}-{hash}", pane_id.replace(':', "_"))
+}
+
+pub fn path(root: &Path, socket: &str, pane_id: &str) -> PathBuf {
+    dir(root).join(format!("{}.json", record_stem(socket, pane_id)))
 }
 
 pub fn load(root: &Path, socket: &str, pane_id: &str) -> Option<Record> {
@@ -74,6 +86,50 @@ pub fn load(root: &Path, socket: &str, pane_id: &str) -> Option<Record> {
 pub fn save(root: &Path, record: &Record) -> Result<()> {
     std::fs::create_dir_all(dir(root))?;
     crate::project::write_json(&path(root, &record.socket, &record.pane_id), record)
+}
+
+/// Load-modify-save under one lock for the whole directory: `channel pull`
+/// rewrites the record every two seconds and must not drop a concurrent
+/// `report` or hook write. Saves only when the record changed.
+fn update(root: &Path, socket: &str, pane_id: &str, change: impl FnOnce(&mut Record)) -> Result<()> {
+    std::fs::create_dir_all(dir(root))?;
+    let lock = std::fs::File::options().create(true).truncate(false).write(true).open(dir(root).join(".lock"))?;
+    lock.lock()?;
+    let mut record = load(root, socket, pane_id).unwrap_or_default();
+    let before = record.clone();
+    change(&mut record);
+    if record != before {
+        save(root, &record)?;
+    }
+    Ok(())
+}
+
+/// The heartbeat of `channel pull`: marks the pane's channel live without
+/// touching the report, so heartbeats never age or refresh progress. The
+/// live terminal id always wins, so items queued now are stamped with it;
+/// a report of an earlier terminal with this pane id is dropped with it.
+pub fn touch_channel(root: &Path, socket: &str, pane_id: &str, terminal_id: &str, agent: &str, now: i64) -> Result<()> {
+    update(root, socket, pane_id, |record| {
+        if !terminal_id.is_empty() && record.terminal_id != terminal_id {
+            if !record.terminal_id.is_empty() {
+                *record = Record::default();
+            }
+            record.terminal_id = terminal_id.to_string();
+        }
+        record.socket = socket.to_string();
+        record.pane_id = pane_id.to_string();
+        if record.agent.is_empty() {
+            record.agent = agent.to_string();
+        }
+        record.channel = CHANNEL_OMP.to_string();
+        record.channel_seen = now;
+    })
+}
+
+/// Whether the OMP extension pulled this pane's channel within the last
+/// `CHANNEL_FRESH_SECS`, so a queued prompt will be picked up.
+pub fn channel_fresh(root: &Path, socket: &str, pane_id: &str, now: i64) -> bool {
+    load(root, socket, pane_id).is_some_and(|r| r.channel == CHANNEL_OMP && now - r.channel_seen <= CHANNEL_FRESH_SECS)
 }
 
 pub fn remove(root: &Path, socket: &str, pane_id: &str) {
@@ -107,12 +163,15 @@ pub fn clean(input: &str, columns: usize) -> String {
 
 /// The calling pane, when this process runs inside a Herdr pane: the id
 /// Herdr shows for it (a moved pane keeps its launch-time `HERDR_PANE_ID`),
-/// its terminal id and the agent Herdr detects. `None` outside Herdr.
+/// its terminal id, the agent Herdr detects and its working directories
+/// (empty when herdr does not report them). `None` outside Herdr.
 pub struct Current {
     pub socket: String,
     pub pane_id: String,
     pub terminal_id: String,
     pub agent: String,
+    pub cwd: String,
+    pub foreground_cwd: String,
 }
 
 pub fn current(env: &Env, runner: &dyn Runner) -> Option<Current> {
@@ -135,6 +194,8 @@ pub fn current_within(env: &Env, runner: &dyn Runner, timeout: std::time::Durati
         pane_id,
         terminal_id: pane["terminal_id"].as_str().unwrap_or("").to_string(),
         agent: pane["agent"].as_str().unwrap_or("").to_string(),
+        cwd: pane["cwd"].as_str().unwrap_or("").to_string(),
+        foreground_cwd: pane["foreground_cwd"].as_str().unwrap_or("").to_string(),
     })
 }
 
@@ -153,15 +214,15 @@ pub fn report(ctx: &Ctx, percent: Option<u8>, activity: &str) -> Result<()> {
     if activity.is_empty() {
         bail!("--activity is empty");
     }
-    let mut record = load(&ctx.root, &pane.socket, &pane.pane_id).unwrap_or_default();
-    record.socket = pane.socket.clone();
-    record.pane_id = pane.pane_id.clone();
-    record.terminal_id = pane.terminal_id.clone();
-    record.agent = pane.agent.clone();
-    record.activity = activity.clone();
-    record.percent = percent;
-    record.reported_at = now();
-    save(&ctx.root, &record)?;
+    update(&ctx.root, &pane.socket, &pane.pane_id, |record| {
+        record.socket = pane.socket.clone();
+        record.pane_id = pane.pane_id.clone();
+        record.terminal_id = pane.terminal_id.clone();
+        record.agent = pane.agent.clone();
+        record.activity = activity.clone();
+        record.percent = percent;
+        record.reported_at = now();
+    })?;
     let herdr = Herdr::new(ctx.env.herdr_bin(), &pane.socket, ctx.runner);
     let token = format!("hp_activity={activity}");
     let ttl = ACTIVITY_TTL_MS.to_string();
@@ -235,8 +296,12 @@ pub fn respond(record: &mut Record, kind: &str, prefix: &str, now: i64) -> Optio
     match kind {
         "SessionStart" => {
             // A new session in this pane: the old report no longer describes it.
-            let keep = (record.socket.clone(), record.pane_id.clone(), record.terminal_id.clone(), record.agent.clone());
-            *record = Record { socket: keep.0, pane_id: keep.1, terminal_id: keep.2, agent: keep.3, session_started_at: now, reminded_at: now, ..Record::default() };
+            // An OMP session keeps the channel: it belongs to the extension, not
+            // the session. Any other harness starting in the pane ends it, or
+            // its prompts would wait for an extension that is not there.
+            let old = std::mem::take(record);
+            let (channel, channel_seen) = if old.agent == "omp" { (old.channel, old.channel_seen) } else { Default::default() };
+            *record = Record { socket: old.socket, pane_id: old.pane_id, terminal_id: old.terminal_id, agent: old.agent, channel, channel_seen, session_started_at: now, reminded_at: now, ..Record::default() };
             Some(instructions(prefix, &record.pane_id))
         }
         "UserPromptSubmit" => {
@@ -262,9 +327,9 @@ pub fn respond(record: &mut Record, kind: &str, prefix: &str, now: i64) -> Optio
     }
 }
 
-/// `hook --agent claude|codex`, the entry point the harness hooks run. Silent
-/// (exit 0, no output) outside a Herdr pane, so the same hooks may sit in the
-/// user's settings for every session on the machine.
+/// `hook --agent claude|codex|omp`, the entry point the harness hooks (and the
+/// OMP extension) run. Silent (exit 0, no output) outside a Herdr pane, so the
+/// same hooks may sit in the user's settings for every session on the machine.
 pub fn hook(ctx: &Ctx, agent: &str) -> Result<()> {
     if ctx.env.var("HERDR_ENV") != Some("1") || ctx.env.var("HERDR_PANE_ID").is_none() {
         return Ok(());
@@ -299,17 +364,15 @@ pub fn hook(ctx: &Ctx, agent: &str) -> Result<()> {
     if !pane.agent.is_empty() && pane.agent != agent {
         return Ok(()); // another harness's hook fired in a pane that is not its own
     }
-    let mut record = load(&ctx.root, &pane.socket, &pane.pane_id).unwrap_or_default();
-    record.socket = pane.socket.clone();
-    record.pane_id = pane.pane_id.clone();
-    record.terminal_id = pane.terminal_id.clone();
-    record.agent = if pane.agent.is_empty() { agent.to_string() } else { pane.agent.clone() };
     let prefix = crate::coordinator::current_prefix(&ctx.root)?;
-    let before = record.clone();
-    let text = respond(&mut record, &kind, &prefix, now());
-    if record != before {
-        save(&ctx.root, &record)?;
-    }
+    let mut text = None;
+    update(&ctx.root, &pane.socket, &pane.pane_id, |record| {
+        record.socket = pane.socket.clone();
+        record.pane_id = pane.pane_id.clone();
+        record.terminal_id = pane.terminal_id.clone();
+        record.agent = if pane.agent.is_empty() { agent.to_string() } else { pane.agent.clone() };
+        text = respond(record, &kind, &prefix, now());
+    })?;
     if let Some(text) = text {
         println!("{}", serde_json::json!({"hookSpecificOutput": {"hookEventName": kind, "additionalContext": text}}));
     }
@@ -339,6 +402,7 @@ pub fn prune(root: &Path, socket: &str, live_pane_ids: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::fake::{FakeRunner, ok};
     use serde_json::json;
 
     #[test]
@@ -360,8 +424,16 @@ mod tests {
     }
 
     #[test]
+    fn the_omp_extensions_hook_payloads_are_eligible() {
+        assert!(eligible(&json!({"hook_event_name":"SessionStart"})));
+        assert!(eligible(&json!({"hook_event_name":"UserPromptSubmit"})));
+        assert!(eligible(&json!({"hook_event_name":"PostToolUse","tool_input":{"command":"bash cargo test -p demo"}})));
+        assert!(!eligible(&json!({"hook_event_name":"PostToolUse","tool_input":{"command":"bash /p/herdr-projects --root /r report --percent 40 --activity x"}})));
+    }
+
+    #[test]
     fn session_start_injects_instructions_and_resets_the_record() {
-        let mut record = Record { pane_id: "w1:p1".into(), activity: "Old".into(), percent: Some(50), reported_at: 5, ..Record::default() };
+        let mut record = Record { pane_id: "w1:p1".into(), agent: "omp".into(), activity: "Old".into(), percent: Some(50), reported_at: 5, channel: CHANNEL_OMP.into(), channel_seen: 990, ..Record::default() };
         let text = respond(&mut record, "SessionStart", "/p/hp --root /r", 1000).unwrap();
         assert!(text.contains("/p/hp --root /r report --percent 25"));
         assert!(text.contains("(w1:p1)"));
@@ -369,6 +441,13 @@ mod tests {
         assert_eq!(record.percent, None);
         assert_eq!(record.reported_at, 0);
         assert_eq!(record.session_started_at, 1000);
+        assert_eq!((record.channel.as_str(), record.channel_seen), (CHANNEL_OMP, 990), "a new OMP session keeps the extension's channel");
+
+        // Another harness started in the pane the extension pulled from: its
+        // prompts must not wait for an extension that is gone.
+        let mut claude = Record { pane_id: "w1:p1".into(), agent: "claude".into(), channel: CHANNEL_OMP.into(), channel_seen: 990, ..Record::default() };
+        respond(&mut claude, "SessionStart", "hp", 1000);
+        assert_eq!((claude.channel.as_str(), claude.channel_seen), ("", 0));
     }
 
     #[test]
@@ -404,5 +483,71 @@ mod tests {
         prune(root.path(), "/a.sock", &["w1:p2".into()]);
         assert!(load(root.path(), "/a.sock", "w1:p1").is_none());
         assert!(load(root.path(), "/b.sock", "w1:p1").is_some());
+    }
+
+    #[test]
+    fn records_written_before_channels_existed_still_load() {
+        let old = r#"{"socket":"/a.sock","pane_id":"w1:p1","terminal_id":"t1","agent":"claude","activity":"Testing","percent":40,"reported_at":7,"reminded_at":6,"session_started_at":5}"#;
+        let record: Record = serde_json::from_str(old).unwrap();
+        assert_eq!((record.activity.as_str(), record.percent, record.reported_at), ("Testing", Some(40), 7));
+        assert_eq!((record.channel.as_str(), record.channel_seen), ("", 0));
+        let saved = serde_json::to_value(Record { channel: CHANNEL_OMP.into(), channel_seen: 9, ..record }).unwrap();
+        assert_eq!((saved["channel"].as_str(), saved["channel_seen"].as_i64()), (Some(CHANNEL_OMP), Some(9)));
+    }
+
+    #[test]
+    fn heartbeats_mark_the_channel_and_never_touch_the_report() {
+        let root = tempfile::tempdir().unwrap();
+        let report = Record { socket: "/a.sock".into(), pane_id: "w1:p1".into(), terminal_id: "t1".into(), agent: "omp".into(), activity: "Testing".into(), percent: Some(40), reported_at: 900, reminded_at: 950, session_started_at: 800, ..Record::default() };
+        save(root.path(), &report).unwrap();
+        touch_channel(root.path(), "/a.sock", "w1:p1", "t1", "other", 1000).unwrap();
+        let touched = load(root.path(), "/a.sock", "w1:p1").unwrap();
+        assert_eq!(touched, Record { channel: CHANNEL_OMP.into(), channel_seen: 1000, ..report.clone() }, "only the channel fields change");
+        // A pull that does not know its terminal keeps the stored one.
+        touch_channel(root.path(), "/a.sock", "w1:p1", "", "other", 1001).unwrap();
+        assert_eq!(load(root.path(), "/a.sock", "w1:p1").unwrap().terminal_id, "t1");
+
+        // A new terminal with this pane id (herdr restarted): its id wins, so
+        // items queued now are its own, and the old terminal's report goes.
+        touch_channel(root.path(), "/a.sock", "w1:p1", "t2", "omp", 1002).unwrap();
+        let restarted = load(root.path(), "/a.sock", "w1:p1").unwrap();
+        assert_eq!((restarted.terminal_id.as_str(), restarted.agent.as_str(), restarted.channel_seen), ("t2", "omp", 1002));
+        assert!(!restarted.reported());
+
+        // No record yet: the heartbeat creates one bound to the pane, with no report.
+        touch_channel(root.path(), "/a.sock", "w1:p2", "t3", "omp", 1000).unwrap();
+        let fresh = load(root.path(), "/a.sock", "w1:p2").unwrap();
+        assert_eq!((fresh.terminal_id.as_str(), fresh.agent.as_str()), ("t3", "omp"));
+        assert!(!fresh.reported());
+        assert!(self_report(root.path(), "/a.sock", "w1:p2", "t3").is_none());
+    }
+
+    #[test]
+    fn a_channel_is_fresh_for_ten_seconds_after_the_last_pull() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(!channel_fresh(root.path(), "/a.sock", "w1:p1", 1000), "no record");
+        save(root.path(), &Record { socket: "/a.sock".into(), pane_id: "w1:p1".into(), reported_at: 999, ..Record::default() }).unwrap();
+        assert!(!channel_fresh(root.path(), "/a.sock", "w1:p1", 1000), "reports alone are no channel");
+        touch_channel(root.path(), "/a.sock", "w1:p1", "", "omp", 1000).unwrap();
+        assert!(channel_fresh(root.path(), "/a.sock", "w1:p1", 1000 + CHANNEL_FRESH_SECS));
+        assert!(!channel_fresh(root.path(), "/a.sock", "w1:p1", 1001 + CHANNEL_FRESH_SECS));
+        assert!(!channel_fresh(root.path(), "/b.sock", "w1:p1", 1000), "another session's pane");
+    }
+
+    #[test]
+    fn a_report_keeps_the_channel() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[("HERDR_ENV", "1"), ("HERDR_PANE_ID", "w1:p1"), ("HERDR_SOCKET_PATH", "/a.sock")]);
+        let runner = FakeRunner::new();
+        runner.on("pane current", ok(r#"{"result":{"pane":{"pane_id":"w1:p1","terminal_id":"t1","agent":"omp"}}}"#));
+        runner.on("report-metadata", ok(r#"{"result":{}}"#));
+        let root = home.path().join("root");
+        let ctx = Ctx { env: &env, root: root.clone(), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: false };
+        touch_channel(&root, "/a.sock", "w1:p1", "t1", "omp", 1000).unwrap();
+        report(&ctx, Some(30), "Reading code").unwrap();
+        let record = load(&root, "/a.sock", "w1:p1").unwrap();
+        assert_eq!((record.activity.as_str(), record.percent), ("Reading code", Some(30)));
+        assert!(record.reported());
+        assert_eq!((record.channel.as_str(), record.channel_seen), (CHANNEL_OMP, 1000));
     }
 }

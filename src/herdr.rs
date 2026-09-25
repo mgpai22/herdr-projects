@@ -98,6 +98,12 @@ impl<'a> Herdr<'a> {
         }
     }
 
+    /// True when calls are forwarded to a saved machine: its pane ids are
+    /// another server's.
+    pub fn remote(&self) -> bool {
+        self.machine.is_some()
+    }
+
     /// `HERDR_SESSION` is removed so an inherited value can never compete with
     /// the socket this project recorded.
     pub fn cmd(&self, timeout: Duration) -> Cmd {
@@ -123,8 +129,10 @@ impl<'a> Herdr<'a> {
 }
 
 /// A herdr call that failed. `code` is herdr's own error code (for example
-/// `agent_blocked` or `pane_not_found`), or `timeout` / `unreachable` / `failed`
-/// when herdr never answered with one.
+/// `agent_blocked`, or `agent_not_found` from `agent prompt` for a pane that
+/// is gone or runs no agent), `usage` when herdr's CLI refused the arguments
+/// (exit 2, no JSON: an older herdr that lacks an option), or `timeout` /
+/// `unreachable` / `failed` when herdr never answered with one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HerdrError {
     pub code: String,
@@ -138,6 +146,21 @@ impl std::fmt::Display for HerdrError {
 }
 
 impl std::error::Error for HerdrError {}
+
+impl HerdrError {
+    /// True when trying again cannot help: the OMP profile is unknown there
+    /// or invalid, the kind takes no profile, that herdr (server or CLI)
+    /// predates `--profile`, or the agent came up under another profile.
+    pub fn launch_refused(&self) -> bool {
+        matches!(self.code.as_str(), "unknown_launch_profile" | "invalid_launch_profile" | "agent_profile_requires_omp" | "agent_profile_unsupported" | "launch_profile_mismatch" | "usage")
+    }
+
+    /// herdr saw the wrong profile only after the agent started: that agent
+    /// keeps running in the pane, under its name, with the other profile.
+    pub fn agent_left_running(&self) -> bool {
+        self.code == "launch_profile_mismatch"
+    }
+}
 
 pub const AGENT_START_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -214,6 +237,9 @@ pub struct Agent {
     pub state_change_seq: u64,
     #[serde(default)]
     pub agent_session: Option<AgentSession>,
+    /// The OMP profile herdr's hook reported; None for other kinds.
+    #[serde(default)]
+    pub launch_profile: Option<String>,
 }
 
 impl Agent {
@@ -230,6 +256,12 @@ impl Agent {
 
     pub fn session_id(&self) -> &str {
         self.agent_session.as_ref().map(|s| s.value.as_str()).unwrap_or("")
+    }
+
+    /// The reported OMP profile as records store it: "" for the default
+    /// profile, for other kinds, and for a name herdr-projects would refuse.
+    pub fn omp_profile(&self) -> String {
+        crate::omp::normalize_profile(self.launch_profile.as_deref().unwrap_or_default()).unwrap_or_default()
     }
 }
 
@@ -263,6 +295,9 @@ impl<'a> Herdr<'a> {
         let reply = [&out.stdout, &out.stderr]
             .into_iter()
             .find_map(|text| serde_json::from_str::<serde_json::Value>(text.trim()).ok());
+        // herdr's CLI parser answers a usage error with exit 2 and plain text
+        // (`unknown option: --profile`); a forwarded call may lose the status.
+        let usage = reply.is_none() && (out.code == Some(2) || out.stderr.contains("unknown option"));
         if let Some(reply) = reply {
             if let Some(error) = reply.get("error") {
                 return Err(HerdrError {
@@ -278,7 +313,7 @@ impl<'a> Herdr<'a> {
             return Ok(serde_json::Value::Null);
         }
         Err(HerdrError {
-            code: "failed".into(),
+            code: if usage { "usage" } else { "failed" }.into(),
             message: format!("`herdr {}`: {}", args.join(" "), out.error_text()),
         })
     }
@@ -418,10 +453,15 @@ impl<'a> Herdr<'a> {
     }
 
     /// Starts an agent in a pane that is at a shell prompt. Success means herdr
-    /// detected the agent and it is ready for input.
-    pub fn agent_start(&self, name: &str, kind: &str, pane: &str, agent_args: &[String]) -> Result<Agent, HerdrError> {
+    /// detected the agent and it is ready for input. A non-empty `profile`
+    /// makes herdr run that OMP profile's launcher.
+    pub fn agent_start(&self, name: &str, kind: &str, profile: &str, pane: &str, agent_args: &[String]) -> Result<Agent, HerdrError> {
         let timeout_ms = AGENT_START_TIMEOUT.as_millis().to_string();
-        let mut args = vec!["agent", "start", name, "--kind", kind, "--pane", pane, "--timeout", &timeout_ms];
+        let mut args = vec!["agent", "start", name, "--kind", kind];
+        if !profile.is_empty() {
+            args.extend(["--profile", profile]);
+        }
+        args.extend(["--pane", pane, "--timeout", &timeout_ms]);
         if !agent_args.is_empty() {
             args.push("--");
             args.extend(agent_args.iter().map(String::as_str));
@@ -488,6 +528,11 @@ impl<'a> Herdr<'a> {
 
     pub fn agent_focus(&self, target: &str) -> Result<(), HerdrError> {
         self.call(&["agent", "focus", target], CALL_TIMEOUT).map(|_| ())
+    }
+
+    /// Closes a pane, and with it the agent running there.
+    pub fn pane_close(&self, pane: &str) -> Result<(), HerdrError> {
+        self.call(&["pane", "close", pane], CALL_TIMEOUT).map(|_| ())
     }
 
     /// Names an already detected agent (after Herdr's native resume leaves a

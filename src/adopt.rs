@@ -73,6 +73,10 @@ pub fn adopt(ctx: &Ctx, slug: &str, pane: &str, title: &str, task: Option<String
         t.branch = branch;
         t.origin = origin;
         t.agent = agent.agent.clone();
+        t.omp_profile = agent.omp_profile();
+        // Like upstream, no profile name: a relaunch takes the built-in of its
+        // kind with the pane's OMP profile, and a user table that replaced
+        // `omp-<name>` never moves the thread to another OMP profile.
         // Not started by the binary: whatever name herdr reports, possibly empty.
         t.agent_name = agent.name.clone();
         t.cwd = agent.cwd.clone();
@@ -109,7 +113,8 @@ pub fn adopt(ctx: &Ctx, slug: &str, pane: &str, title: &str, task: Option<String
 
     // Prompt now when the agent is ready for one; otherwise the ticker's one
     // delivery path sends the line later (also when the agent ends in `done`).
-    let sent = agent.ready() && herdr.agent_prompt(pane, &thread::launch_prompt(slug, &id)).is_ok();
+    let prompt = thread::launch_prompt(slug, &id, &agent.agent, created.uses_mstack(ctx.env));
+    let sent = agent.ready() && crate::delivery::send(&ctx.root, &herdr, &record.socket, pane, crate::delivery::routed(&ctx.root, &record.socket, pane, false), "brief", &prompt).is_ok();
     let adopted = thread::update(&project, &id, |t| {
         t.status = Status::Open;
         t.prompt_pending = !sent;
@@ -154,7 +159,7 @@ pub fn adopt_workspace(ctx: &Ctx, args: &AdoptWorkspace) -> Result<()> {
     let project = project::create(&ctx.root, &args.name, &args.goal, repos)?;
     let config = crate::profiles::load(&ctx.config_dir)?;
     crate::profiles::write_project_defaults(&project, &config.new_project_default(crate::profiles::Role::Thread), &config.new_project_default(crate::profiles::Role::Coordinator))?;
-    project::write_priming(&project, &coordinator::current_prefix(&ctx.root)?)?;
+    project::write_priming(&project, &coordinator::current_prefix(&ctx.root)?, ctx.env, &ctx.config_dir)?;
     println!("created `{}` at {}", project.slug, project.dir().display());
     coordinator::open(ctx, &project.slug, &coordinator::OpenOptions { session: SessionFlags { session: None, socket: Some(session.socket.clone()) }, rebind: false, profile: None, new: false, here: false })?;
     let adopted = adopt(ctx, &project.slug, &args.pane, &args.name, None)?;
@@ -237,6 +242,19 @@ mod tests {
         // the pane is adoptable there: ids are only compared within one socket.
         assert!(t.is_ok(), "{t:?}");
         let _ = other;
+    }
+
+    #[test]
+    fn adopting_records_the_panes_omp_profile_and_no_profile_name() {
+        let (world, _, cwd) = world_with_agent("working", "my-agent");
+        let json_cwd = crate::scenarios::json_path(&cwd);
+        let omp = |pane: &str, profile: &str| format!(r#"{{"pane_id":"{pane}","tab_id":"w5:t1","workspace_id":"w5","cwd":"{json_cwd}","agent":"omp","agent_status":"working","launch_profile":"{profile}"}}"#);
+        *world.agents.borrow_mut() = format!("[{},{}]", omp("w5:p1", "neurable"), omp("w5:p2", "default"));
+        let named = adopt(&world.ctx(), "demo", "w5:p1", "Named", None).unwrap();
+        assert_eq!((named.omp_profile.as_str(), named.profile.as_str(), named.profile_name().as_str()), ("neurable", "", "omp-neurable"));
+        // herdr's "default" is stored as the empty default, like every record.
+        let default = adopt(&world.ctx(), "demo", "w5:p2", "Default", None).unwrap();
+        assert_eq!((default.omp_profile.as_str(), default.profile.as_str(), default.profile_name().as_str()), ("", "", "omp"));
     }
 
     #[test]

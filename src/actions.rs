@@ -117,7 +117,7 @@ pub fn run_action(ctx: &Ctx, id: &str) -> Result<()> {
                         println!("{note}");
                     }
                     crate::setup::apply_live(ctx);
-                    let _ = herdr.notification_show("Projects configured", "Sidebar rows, popup key, progress hooks and the autoproject skill are set. Run `reload config` if the rows are not visible yet.");
+                    let _ = herdr.notification_show("Projects configured", "Sidebar rows, popup key, progress hooks, the OMP extension (when OMP is installed) and the autoproject skill are set. Run `reload config` if the rows are not visible yet.");
                 }
                 Err(error) => {
                     let _ = herdr.notification_show("Projects: configure failed", &format!("{error:#}"));

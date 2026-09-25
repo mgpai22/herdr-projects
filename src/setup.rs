@@ -95,18 +95,39 @@ fn remove_ours(kind: &str, text: &str, command: Option<&str>) -> Result<String> 
 }
 
 /// Herdr's config file: `HERDR_CONFIG_PATH`, else `$XDG_CONFIG_HOME/herdr`,
-/// else `~/.config/herdr/config.toml`.
+/// else herdr's platform config dir (`~/.config/herdr`, or `%APPDATA%\herdr`
+/// on Windows, as herdr's own `config::io::config_dir`).
 pub fn herdr_config_path(env: &Env) -> PathBuf {
     if let Some(path) = env.var("HERDR_CONFIG_PATH") {
         return PathBuf::from(path);
     }
-    env.var("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| env.home.join(".config")).join("herdr/config.toml")
+    herdr_config_dir(env).join("config.toml")
+}
+
+pub fn herdr_config_dir(env: &Env) -> PathBuf {
+    if let Some(dir) = env.var("XDG_CONFIG_HOME") {
+        return PathBuf::from(dir).join("herdr");
+    }
+    #[cfg(windows)]
+    if let Some(dir) = env.var("APPDATA") {
+        return PathBuf::from(dir).join("herdr");
+    }
+    env.home.join(".config").join("herdr")
 }
 
 /// The tab-bar command: absolute paths, since it runs under `/bin/sh -lc` on
 /// the server with no plugin environment.
+#[cfg(unix)]
 pub fn tab_command(binary: &Path, root: &Path) -> String {
     format!("{} --root {} needs-you --line", quote(&binary.to_string_lossy()), quote(&root.to_string_lossy()))
+}
+
+/// The tab-bar command. Herdr on Windows runs it as `cmd.exe /d /c <line>`:
+/// both paths in double quotes, and the whole line quoted once more, because
+/// cmd strips the first and last quote of a line holding more than two.
+#[cfg(windows)]
+pub fn tab_command(binary: &Path, root: &Path) -> String {
+    format!("\"\"{}\" --root \"{}\" needs-you --line\"", binary.display(), root.display())
 }
 
 fn hook_entry(command: &str) -> serde_json::Value {
@@ -175,7 +196,14 @@ pub fn hooks(input: &str, command: &str, remove: bool) -> Result<String> {
 /// failing UserPromptSubmit hook (exit 2) as "block this prompt", in every
 /// session on the machine, so a missing or older binary must not do that.
 pub fn hook_command(binary: &Path, root: &Path, agent: &str) -> String {
-    format!("{} --root {} hook --agent {agent} 2>/dev/null || true", quote(&binary.to_string_lossy()), quote(&root.to_string_lossy()))
+    format!("{} --root {} hook --agent {agent} 2>/dev/null || true", quote(&crate::paths::shell_path(binary)), quote(&crate::paths::shell_path(root)))
+}
+
+/// The harnesses whose hook file `configure` edits. Not Codex on Windows:
+/// there Codex runs a hook through the user's shell (cmd, PowerShell or Git
+/// Bash), and no single hook command line works in all three.
+pub fn hook_agents() -> &'static [&'static str] {
+    if cfg!(windows) { &["claude"] } else { &["claude", "codex"] }
 }
 
 /// Where each harness keeps its hooks.
@@ -194,6 +222,81 @@ pub fn hook_file(env: &Env, agent: &str, claude_home: Option<&Path>, codex_home:
     }
 }
 
+/// Whether a harness is installed: its config directory exists (for OMP, any
+/// profile's agent directory).
+pub fn installed(env: &Env, agent: &str, claude_home: Option<&Path>, codex_home: Option<&Path>) -> bool {
+    match agent {
+        "omp" => !crate::omp::profile_agent_dirs(env).is_empty(),
+        _ => hook_file(env, agent, claude_home, codex_home).parent().is_some_and(Path::is_dir),
+    }
+}
+
+/// The OMP agent dirs `configure` writes to for these clients: `omp` means
+/// every profile, `omp:<profile>` one (`omp:` the default; `doctor --fix`).
+/// With no profile agent dir at all, the default one, which `configure` creates.
+fn omp_agent_dirs(env: &Env, clients: &[String]) -> Vec<PathBuf> {
+    let mut dirs = crate::omp::profile_agent_dirs(env);
+    if dirs.is_empty() {
+        dirs.push((String::new(), crate::omp::agent_dir(env, "")));
+    }
+    dirs.into_iter().filter(|(name, _)| clients.iter().any(|c| c == "omp" || c.strip_prefix("omp:") == Some(name.as_str()))).map(|(_, dir)| dir).collect()
+}
+
+/// Bump together with line 1 of `assets/omp/herdr-projects.ts`.
+pub const OMP_EXTENSION_VERSION: u32 = 1;
+const OMP_EXTENSION: &str = include_str!("../assets/omp/herdr-projects.ts");
+/// Line 1 of every copy this plugin wrote, of any version.
+const OMP_HEADER: &str = "// HERDR_PROJECTS_OMP_VERSION=";
+
+/// OMP discovers extensions in `<agent dir>/extensions`, per profile. OMP has
+/// no hook file: this extension stands in for the hooks.
+pub fn omp_extension_path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("extensions/herdr-projects.ts")
+}
+
+/// The bundled extension with the binary and root filled in as JSON strings,
+/// since the extension runs outside the plugin environment.
+pub fn render_omp_extension(binary: &Path, root: &Path) -> String {
+    let literal = |path: &Path| serde_json::to_string(&path.to_string_lossy()).expect("a string serializes");
+    OMP_EXTENSION.replacen("\"__HP_BINARY__\"", &literal(binary), 1).replacen("\"__HP_ROOT__\"", &literal(root), 1)
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ExtensionState {
+    Missing,
+    /// Byte for byte the current render.
+    Current,
+    /// Ours, from another version, binary or root: rewritten.
+    Stale,
+    /// Not ours (no header, or a link): never touched.
+    Foreign,
+}
+
+pub fn omp_extension_state(path: &Path, rendered: &str) -> Result<ExtensionState> {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Ok(ExtensionState::Foreign);
+    }
+    Ok(match read(path)? {
+        None => ExtensionState::Missing,
+        Some(text) if text == rendered => ExtensionState::Current,
+        Some(text) if text.starts_with(OMP_HEADER) => ExtensionState::Stale,
+        Some(_) => ExtensionState::Foreign,
+    })
+}
+
+/// The root a copy of ours was rendered for: its `const ROOT = "…";` line.
+pub fn omp_extension_root(text: &str) -> Option<String> {
+    let literal = text.lines().find_map(|l| l.strip_prefix("const ROOT = ")?.strip_suffix(';'))?;
+    serde_json::from_str(literal).ok()
+}
+
+/// Whether OMP already loads the bundled skill through `~/.agents/skills`
+/// (the Codex link), which every OMP profile reads: a second link would list it twice.
+pub fn omp_sees_shared_skill(env: &Env, source: &Path) -> bool {
+    let shared = crate::paths::canonicalize(env.home.join(".agents/skills").join(SKILL));
+    shared.is_ok_and(|shared| crate::paths::canonicalize(source).is_ok_and(|source| source == shared))
+}
+
 /// The skill bundled with the plugin, linked into each harness by `configure`.
 pub const SKILL: &str = "autoproject";
 
@@ -204,10 +307,8 @@ pub fn skill_source() -> Option<PathBuf> {
 }
 
 /// Where a harness looks for user skills: Claude Code's `<config dir>/skills`,
-/// Codex's user scope `~/.agents/skills` (not under `CODEX_HOME`). A skills
-/// directory that is itself a link is resolved, so a shared directory gets
-/// one link and one journal key; a missing one is resolved through its
-/// parent, so the key stays the same once it exists.
+/// Codex's user scope `~/.agents/skills` (not under `CODEX_HOME`); OMP's is
+/// `omp_skill_link`.
 pub fn skill_link(env: &Env, agent: &str, claude_home: Option<&Path>) -> PathBuf {
     let dir = match agent {
         "claude" => claude_home
@@ -217,7 +318,19 @@ pub fn skill_link(env: &Env, agent: &str, claude_home: Option<&Path>) -> PathBuf
             .join("skills"),
         _ => env.home.join(".agents/skills"),
     };
-    let resolved = std::fs::canonicalize(&dir).or_else(|_| std::fs::canonicalize(dir.parent().unwrap_or(&dir)).map(|p| p.join("skills")));
+    link_in(dir)
+}
+
+/// OMP's `<agent dir>/skills`, per profile.
+pub fn omp_skill_link(agent_dir: &Path) -> PathBuf {
+    link_in(agent_dir.join("skills"))
+}
+
+/// The skill link in a skills directory. One that is itself a link is
+/// resolved, so a shared directory gets one link and one journal key; a
+/// missing one is resolved through its parent, so the key stays the same once it exists.
+fn link_in(dir: PathBuf) -> PathBuf {
+    let resolved = crate::paths::canonicalize(&dir).or_else(|_| crate::paths::canonicalize(dir.parent().unwrap_or(&dir)).map(|p| p.join("skills")));
     resolved.unwrap_or(dir).join(SKILL)
 }
 
@@ -247,13 +360,14 @@ pub fn skill_state(link: &Path, source: &Path) -> SkillState {
 }
 
 pub struct ConfigureOptions {
-    /// `claude`, `codex`, or both; empty means every harness whose config
-    /// directory exists.
+    /// `claude`, `codex`, `omp` (every OMP profile), or any mix; empty means
+    /// every harness whose config directory exists. `omp:<profile>` (`omp:`
+    /// for the default) limits OMP to one profile, for `doctor --fix`.
     pub clients: Vec<String>,
     pub claude_home: Option<PathBuf>,
     pub codex_home: Option<PathBuf>,
     pub dry_run: bool,
-    /// Install the progress hooks; `false` links only the skill (`doctor --fix`).
+    /// Install the progress hooks and the OMP extension; `false` links only the skill (`doctor --fix`).
     pub hooks: bool,
     /// Also edit Herdr's config.toml: sidebar rows, popup key, tab-bar entry.
     pub sidebar: bool,
@@ -271,14 +385,14 @@ pub fn has_agent_progress_hooks(text: &str) -> bool {
     text.contains("herdr-progress") && text.contains(" hook --agent ")
 }
 
-/// Installs the hooks. Every edit is journaled before it is made, so a killed
-/// run never leaves hooks `unconfigure` cannot identify as its own.
+/// Installs the hooks and the OMP extension. Every edit is journaled before it
+/// is made, so a killed run never leaves hooks `unconfigure` cannot identify as its own.
 pub fn configure(ctx: &Ctx, options: &ConfigureOptions) -> Result<Vec<String>> {
     let binary = crate::paths::binary()?;
     let clients: Vec<String> = if options.clients.is_empty() {
-        ["claude", "codex"]
+        ["claude", "codex", "omp"]
             .into_iter()
-            .filter(|c| hook_file(ctx.env, c, options.claude_home.as_deref(), options.codex_home.as_deref()).parent().is_some_and(Path::is_dir))
+            .filter(|c| installed(ctx.env, c, options.claude_home.as_deref(), options.codex_home.as_deref()))
             .map(str::to_owned)
             .collect()
     } else {
@@ -288,6 +402,10 @@ pub fn configure(ctx: &Ctx, options: &ConfigureOptions) -> Result<Vec<String>> {
     let mut edits: Vec<(PathBuf, Owned)> = Vec::new();
     let mut notes = Vec::new();
     for client in clients.iter().filter(|c| options.hooks && matches!(c.as_str(), "claude" | "codex")) {
+        if !hook_agents().contains(&client.as_str()) {
+            notes.push(format!("{client}: no hooks installed on Windows; {client} runs hooks through your own shell (cmd, PowerShell or Git Bash), and no single hook command works in all of them"));
+            continue;
+        }
         let file = hook_file(ctx.env, client, options.claude_home.as_deref(), options.codex_home.as_deref());
         let command = hook_command(&binary, &ctx.root, client);
         let before = read(&file)?;
@@ -302,11 +420,31 @@ pub fn configure(ctx: &Ctx, options: &ConfigureOptions) -> Result<Vec<String>> {
         notes.push(format!("{}: {} hook entries for `{command}`", file.display(), if before.is_some() { "adding" } else { "creating with" }));
         edits.push((file, Owned { before, after, kind: "hooks".into(), command: Some(command) }));
     }
+    if options.hooks {
+        for dir in omp_agent_dirs(ctx.env, &clients) {
+            let file = omp_extension_path(&dir);
+            let after = render_omp_extension(&binary, &ctx.root);
+            match omp_extension_state(&file, &after)? {
+                ExtensionState::Current => notes.push(format!("{}: OMP extension already in place", file.display())),
+                ExtensionState::Missing => {
+                    notes.push(format!("{}: installing the OMP extension (v{OMP_EXTENSION_VERSION})", file.display()));
+                    edits.push((file, Owned { before: None, after, kind: "omp-extension".into(), command: None }));
+                }
+                ExtensionState::Stale => {
+                    notes.push(format!("{}: rewriting the OMP extension (v{OMP_EXTENSION_VERSION}, this binary and root)", file.display()));
+                    edits.push((file.clone(), Owned { before: read(&file)?, after, kind: "omp-extension".into(), command: None }));
+                }
+                ExtensionState::Foreign => notes.push(format!("{}: left alone, it is not this plugin's file; move it away and run `configure` again to install the OMP extension", file.display())),
+            }
+        }
+    }
     let mut links: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
     if let Some(source) = &options.skill {
         let mut seen = Vec::new();
-        for client in clients.iter().filter(|c| matches!(c.as_str(), "claude" | "codex")) {
-            let link = skill_link(ctx.env, client, options.claude_home.as_deref());
+        let mut targets: Vec<(bool, PathBuf)> = clients.iter().filter(|c| matches!(c.as_str(), "claude" | "codex")).map(|c| (false, skill_link(ctx.env, c, options.claude_home.as_deref()))).collect();
+        // OMP last, so a Codex link made in this run counts as already there.
+        targets.extend(omp_agent_dirs(ctx.env, &clients).iter().map(|dir| (true, omp_skill_link(dir))));
+        for (omp, link) in targets {
             if seen.contains(&link) {
                 continue;
             }
@@ -314,6 +452,10 @@ pub fn configure(ctx: &Ctx, options: &ConfigureOptions) -> Result<Vec<String>> {
             if !source.join("SKILL.md").is_file() {
                 notes.push(format!("{}: no bundled skill at {}; not linked", link.display(), source.display()));
                 break;
+            }
+            if omp && (omp_sees_shared_skill(ctx.env, source) || links.iter().any(|(l, s)| s.is_some() && *l == skill_link(ctx.env, "codex", None))) {
+                notes.push(format!("{}: not linked, OMP already loads the `{SKILL}` skill through ~/.agents/skills", link.display()));
+                continue;
             }
             let journaled = journal.get(&link.to_string_lossy().into_owned()).is_some_and(|o| o.kind == "skill");
             match skill_state(&link, source) {
@@ -372,7 +514,10 @@ pub fn configure(ctx: &Ctx, options: &ConfigureOptions) -> Result<Vec<String>> {
     for (path, edit) in &edits {
         let key = path.to_string_lossy().into_owned();
         let mut owned = edit.clone();
-        if let Some(previous) = journal.get(&key) {
+        if edit.kind == "omp-extension" {
+            // Wholly ours: `unconfigure` deletes it, whatever older copy it replaced.
+            owned.before = None;
+        } else if let Some(previous) = journal.get(&key) {
             owned.before = removal_baseline(previous, &owned)?;
         }
         journal.insert(key, owned);
@@ -398,12 +543,68 @@ pub fn configure(ctx: &Ctx, options: &ConfigureOptions) -> Result<Vec<String>> {
     for (link, source) in &links {
         let Some(source) = source else { continue };
         if std::fs::symlink_metadata(link).is_ok() {
-            std::fs::remove_file(link)?;
+            remove_link(link)?;
         }
         std::fs::create_dir_all(link.parent().context("skill link has no parent")?)?;
-        std::os::unix::fs::symlink(source, link).with_context(|| format!("could not link {}", link.display()))?;
+        if link_dir(source, link).with_context(|| format!("could not link {}", link.display()))? == DirLink::Junction {
+            notes.push(format!("{}: no symbolic link privilege; linked as a directory junction", link.display()));
+        }
     }
     Ok(notes)
+}
+
+#[derive(Debug, PartialEq)]
+pub enum DirLink {
+    Symlink,
+    /// Windows without the symbolic-link privilege (Developer Mode off).
+    #[cfg_attr(unix, allow(dead_code))]
+    Junction,
+}
+
+/// `link -> source`, a directory link. `skill_state` reads both kinds: Rust
+/// reports a junction as a symbolic link and `read_link` returns its target.
+pub fn link_dir(source: &Path, link: &Path) -> std::io::Result<DirLink> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(source, link).map(|_| DirLink::Symlink)
+    }
+    #[cfg(windows)]
+    {
+        const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+        match std::os::windows::fs::symlink_dir(source, link) {
+            Ok(()) => Ok(DirLink::Symlink),
+            Err(e) if e.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => {
+                let out = std::process::Command::new("cmd").args(["/d", "/c", "mklink", "/J"]).arg(link).arg(source).stdin(std::process::Stdio::null()).output()?;
+                if !out.status.success() {
+                    return Err(std::io::Error::other(format!("mklink /J failed: {}", String::from_utf8_lossy(&out.stdout).trim())));
+                }
+                Ok(DirLink::Junction)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Removes a link, never what it points at. Windows removes a directory
+/// link (symbolic or junction) as a directory.
+pub fn remove_link(link: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if std::fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink_dir()) {
+            return std::fs::remove_dir(link);
+        }
+    }
+    std::fs::remove_file(link)
+}
+
+/// A file symbolic link, for tests on either platform (the target may be missing).
+#[cfg(test)]
+pub fn file_link(target: impl AsRef<Path>, link: impl AsRef<Path>) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(target, link).unwrap();
 }
 
 /// Removes exactly what `configure` added: the file goes back to its journaled
@@ -417,11 +618,23 @@ pub fn unconfigure(ctx: &Ctx) -> Result<Vec<String>> {
         if owned.kind == "skill" {
             match skill_state(path, Path::new(&owned.after)) {
                 SkillState::Ours => {
-                    std::fs::remove_file(path)?;
+                    remove_link(path)?;
                     notes.push(format!("{key}: skill link removed"));
                 }
                 SkillState::Missing => notes.push(format!("{key}: already gone")),
                 _ => notes.push(format!("{key}: no longer this plugin's link; left alone")),
+            }
+            remaining.remove(key);
+            continue;
+        }
+        if owned.kind == "omp-extension" {
+            match omp_extension_state(path, &owned.after)? {
+                ExtensionState::Current => {
+                    std::fs::remove_file(path)?;
+                    notes.push(format!("{key}: OMP extension removed"));
+                }
+                ExtensionState::Missing => notes.push(format!("{key}: already gone")),
+                _ => notes.push(format!("{key}: edited since configure; left alone, delete it by hand")),
             }
             remaining.remove(key);
             continue;
@@ -496,11 +709,66 @@ mod tests {
     const CMD: &str = "'/p/herdr-projects' --root /r hook --agent claude 2>/dev/null || true";
 
     #[test]
+    fn herdr_config_follows_herdr_own_lookup() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        let with = |vars: &[(&str, &str)]| herdr_config_path(&Env::for_test(h, vars));
+        assert_eq!(with(&[("HERDR_CONFIG_PATH", "/x/c.toml"), ("XDG_CONFIG_HOME", "/xdg")]), PathBuf::from("/x/c.toml"));
+        assert_eq!(with(&[("XDG_CONFIG_HOME", "/xdg"), ("APPDATA", "/appdata")]), PathBuf::from("/xdg").join("herdr").join("config.toml"));
+        #[cfg(windows)]
+        assert_eq!(with(&[("APPDATA", "/appdata")]), PathBuf::from("/appdata").join("herdr").join("config.toml"));
+        #[cfg(not(windows))]
+        assert_eq!(with(&[("APPDATA", "/appdata")]), h.join(".config").join("herdr").join("config.toml"));
+    }
+
+    #[test]
     fn the_hook_command_never_fails_even_with_a_missing_binary() {
         let command = hook_command(Path::new("/no/such/herdr-projects"), Path::new("/r"), "claude");
-        let out = std::process::Command::new("/bin/sh").args(["-c", &command]).output().unwrap();
+        let shell = if cfg!(windows) { crate::runner::posix_shell() } else { "/bin/sh".to_string() };
+        let out = std::process::Command::new(shell).args(["-c", &command]).output().unwrap();
         assert!(out.status.success());
         assert!(out.stdout.is_empty() && out.stderr.is_empty());
+    }
+
+    /// Herdr on Windows runs the tab-bar line with `cmd.exe /d /c`; paths with
+    /// spaces must reach the program as single arguments.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_tab_command_survives_cmd() {
+        use std::os::windows::process::CommandExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("bin dir");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let binary = bin_dir.join("hp.cmd");
+        std::fs::write(&binary, "@echo [%1] [%2] [%3] [%4]\r\n").unwrap();
+        let root = dir.path().join("my root");
+        let out = std::process::Command::new("cmd").args(["/d", "/c"]).raw_arg(tab_command(&binary, &root)).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), format!("[--root] [\"{}\"] [needs-you] [--line]", root.display()));
+    }
+
+    /// Both kinds of Windows directory link read as ours and are removed
+    /// without touching the skill they point at.
+    #[cfg(windows)]
+    #[test]
+    fn windows_symlinks_and_junctions_are_skill_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("skill");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("SKILL.md"), "x").unwrap();
+        let link = dir.path().join("skills").join(SKILL);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        assert_eq!(link_dir(&source, &link).unwrap(), DirLink::Symlink);
+        assert_eq!(skill_state(&link, &source), SkillState::Ours);
+        remove_link(&link).unwrap();
+        assert_eq!(skill_state(&link, &source), SkillState::Missing);
+        let out = std::process::Command::new("cmd").args(["/d", "/c", "mklink", "/J"]).arg(&link).arg(&source).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+        assert_eq!(skill_state(&link, &source), SkillState::Ours);
+        assert!(link.join("SKILL.md").is_file());
+        remove_link(&link).unwrap();
+        assert_eq!(skill_state(&link, &source), SkillState::Missing);
+        assert!(source.join("SKILL.md").is_file());
     }
 
     #[test]
@@ -564,9 +832,10 @@ mod tests {
         let configured = std::fs::read_to_string(claude.join("settings.json")).unwrap();
         assert!(configured.contains("// mine") && configured.contains("say done"));
         assert_eq!(configured.matches("hook --agent claude").count(), 3);
-        let codex_text = std::fs::read_to_string(codex.join("hooks.json")).unwrap();
-        assert_eq!(codex_text.matches("hook --agent codex").count(), 3);
-        assert_eq!(load_journal(&ctx.config_dir).len(), 2);
+        // Codex gets no hooks on Windows (it runs them through the user's shell).
+        let codex_hooks = std::fs::read_to_string(codex.join("hooks.json")).unwrap_or_default();
+        assert_eq!(codex_hooks.matches("hook --agent codex").count(), if cfg!(windows) { 0 } else { 3 });
+        assert_eq!(load_journal(&ctx.config_dir).len(), if cfg!(windows) { 1 } else { 2 });
         // Idempotent.
         configure(&ctx, &options).unwrap();
         assert_eq!(std::fs::read_to_string(claude.join("settings.json")).unwrap(), configured);
@@ -596,14 +865,14 @@ mod tests {
         std::fs::create_dir_all(home.path().join("codex")).unwrap();
         std::fs::create_dir_all(&claude).unwrap();
         // Like this Mac: Claude's skills dir is itself a link to ~/.agents/skills.
-        std::os::unix::fs::symlink(&shared, claude.join("skills")).unwrap();
+        link_dir(&shared, &claude.join("skills")).unwrap();
         let source = home.path().join("plugin/skill/autoproject");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join("SKILL.md"), "---\nname: autoproject\n---\n").unwrap();
         let runner = crate::runner::fake::FakeRunner::new();
         let ctx = Ctx { env: &env, root: home.path().join("root"), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: false };
         let options = |dry_run: bool, skill: &Path| ConfigureOptions { clients: vec![], claude_home: Some(claude.clone()), codex_home: Some(home.path().join("codex")), dry_run, hooks: true, sidebar: false, key: None, herdr_config: None, skill: Some(skill.to_path_buf()) };
-        let link = std::fs::canonicalize(&shared).unwrap().join(SKILL);
+        let link = crate::paths::canonicalize(&shared).unwrap().join(SKILL);
 
         // A plain directory already there (the old personal copy) is never touched.
         std::fs::create_dir_all(shared.join(SKILL)).unwrap();
@@ -635,21 +904,23 @@ mod tests {
         assert_eq!(skill_state(&link, &moved), SkillState::Missing);
         assert!(shared.is_dir());
         configure(&ctx, &options(false, &moved)).unwrap();
-        std::fs::remove_file(&link).unwrap();
-        std::os::unix::fs::symlink(home.path(), &link).unwrap();
+        remove_link(&link).unwrap();
+        link_dir(home.path(), &link).unwrap();
         let notes = unconfigure(&ctx).unwrap();
         assert!(notes.iter().any(|n| n.contains("left alone")), "{notes:?}");
         assert!(link.is_symlink());
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlinked_config_is_refused_without_touching_the_target() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("real.json");
         let link = dir.path().join("settings.json");
         std::fs::write(&target, "{\"user\":true}").unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&target, &link).unwrap();
         assert!(read(&link).is_err());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"user\":true}");
     }
@@ -691,5 +962,128 @@ mod tests {
         let ctx = Ctx { runner: &rejecting, ..ctx };
         assert!(configure(&ctx, &options(None)).is_err());
         assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+    }
+
+    #[test]
+    fn the_omp_extension_is_installed_rewritten_when_stale_and_removed_only_when_unedited() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = home.path().join("omp-agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        let env = Env::for_test(home.path(), &[("PI_CODING_AGENT_DIR", agent.to_str().unwrap())]);
+        let runner = crate::runner::fake::FakeRunner::new();
+        let ctx_at = |root: &str| Ctx { env: &env, root: home.path().join(root), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: false };
+        let ctx = ctx_at("root");
+        let options = |dry_run: bool| ConfigureOptions { clients: vec![], claude_home: Some(home.path().join("claude")), codex_home: Some(home.path().join("codex")), dry_run, hooks: true, sidebar: false, key: None, herdr_config: None, skill: None };
+        let file = agent.join("extensions/herdr-projects.ts");
+        let binary = crate::paths::binary().unwrap();
+        let rendered = render_omp_extension(&binary, &ctx.root);
+        assert_eq!(rendered.lines().next(), Some(format!("{OMP_HEADER}{OMP_EXTENSION_VERSION}").as_str()), "bump OMP_EXTENSION_VERSION with the asset's header");
+        assert!(!rendered.contains("__HP_") && rendered.contains(&serde_json::to_string(&binary.to_string_lossy()).unwrap()));
+
+        // Auto-detected from the agent dir; a dry run writes nothing.
+        configure(&ctx, &options(true)).unwrap();
+        assert!(!file.exists());
+        configure(&ctx, &options(false)).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), rendered);
+        assert_eq!(load_journal(&ctx.config_dir)[&*file.to_string_lossy()].kind, "omp-extension");
+
+        // An older copy, then another root: rewritten; unconfigure still deletes it.
+        std::fs::write(&file, format!("{OMP_HEADER}0\nold\n")).unwrap();
+        configure(&ctx, &options(false)).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), rendered);
+        let moved = ctx_at("root2");
+        configure(&moved, &options(false)).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), render_omp_extension(&binary, &moved.root));
+        unconfigure(&moved).unwrap();
+        assert!(!file.exists());
+
+        // A file that is not ours is never touched.
+        std::fs::write(&file, "// mine\n").unwrap();
+        let notes = configure(&ctx, &options(false)).unwrap();
+        assert!(notes.iter().any(|n| n.contains("left alone")), "{notes:?}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "// mine\n");
+        std::fs::remove_file(&file).unwrap();
+
+        // Ours, edited after configure: unconfigure leaves it and forgets it.
+        configure(&ctx, &options(false)).unwrap();
+        std::fs::write(&file, format!("{rendered}// tweak\n")).unwrap();
+        let notes = unconfigure(&ctx).unwrap();
+        assert!(notes.iter().any(|n| n.contains("left alone")), "{notes:?}");
+        assert!(file.exists());
+        assert!(load_journal(&ctx.config_dir).is_empty());
+    }
+
+    #[test]
+    fn the_root_a_copy_was_rendered_for_is_read_back() {
+        let root = Path::new("/r/with \"quote\"");
+        let rendered = render_omp_extension(Path::new("/bin/hp"), root);
+        assert_eq!(omp_extension_root(&rendered).as_deref(), Some(root.to_str().unwrap()));
+        assert_eq!(omp_extension_root("// HERDR_PROJECTS_OMP_VERSION=0\nold\n"), None);
+    }
+
+    #[test]
+    fn the_skill_is_linked_for_omp_unless_omp_already_loads_it_through_agents_skills() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = home.path().join("omp-agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        let env = Env::for_test(home.path(), &[("PI_CODING_AGENT_DIR", agent.to_str().unwrap())]);
+        let source = home.path().join("plugin/skill/autoproject");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("SKILL.md"), "---\nname: autoproject\n---\n").unwrap();
+        let runner = crate::runner::fake::FakeRunner::new();
+        let ctx = Ctx { env: &env, root: home.path().join("root"), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: false };
+        let options = |clients: &[&str]| ConfigureOptions { clients: clients.iter().map(|c| c.to_string()).collect(), claude_home: None, codex_home: None, dry_run: false, hooks: false, sidebar: false, key: None, herdr_config: None, skill: Some(source.clone()) };
+        let omp_link = omp_skill_link(&agent);
+
+        configure(&ctx, &options(&["omp"])).unwrap();
+        assert_eq!(skill_state(&omp_link, &source), SkillState::Ours);
+        assert!(agent.join("skills").join(SKILL).join("SKILL.md").is_file());
+        unconfigure(&ctx).unwrap();
+
+        // Codex and OMP in one run, OMP named first: one link, the shared one.
+        let notes = configure(&ctx, &options(&["omp", "codex"])).unwrap();
+        assert_eq!(skill_state(&omp_link, &source), SkillState::Missing, "{notes:?}");
+        assert_eq!(skill_state(&skill_link(&env, "codex", None), &source), SkillState::Ours);
+        // A later OMP-only run sees the shared link.
+        configure(&ctx, &options(&["omp"])).unwrap();
+        assert_eq!(skill_state(&omp_link, &source), SkillState::Missing);
+    }
+
+    #[test]
+    fn configure_installs_into_every_omp_profile_or_one_and_unconfigure_removes_them_all() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        let custom = h.join("omp-agent");
+        let neurable = h.join(".omp/profiles/neurable/agent");
+        for dir in [&custom, &neurable, &h.join(".omp/agent"), &h.join(".omp/profiles/Bad/agent")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        // PI_CODING_AGENT_DIR moves the default profile only.
+        let env = Env::for_test(h, &[("PI_CODING_AGENT_DIR", custom.to_str().unwrap())]);
+        let source = h.join("plugin/skill/autoproject");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("SKILL.md"), "---\nname: autoproject\n---\n").unwrap();
+        let runner = crate::runner::fake::FakeRunner::new();
+        let ctx = Ctx { env: &env, root: h.join("root"), config_dir: h.join("cfg"), runner: &runner, detached_ticker: false };
+        let options = |clients: &[&str]| ConfigureOptions { clients: clients.iter().map(|c| c.to_string()).collect(), claude_home: Some(h.join("claude")), codex_home: Some(h.join("codex")), dry_run: false, hooks: true, sidebar: false, key: None, herdr_config: None, skill: Some(source.clone()) };
+        let installed_in = |dir: &Path| omp_extension_path(dir).is_file() && skill_state(&omp_skill_link(dir), &source) == SkillState::Ours;
+
+        // One profile (`doctor --fix`): only its files.
+        configure(&ctx, &options(&["omp:neurable"])).unwrap();
+        assert!(installed_in(&neurable) && !installed_in(&custom));
+        configure(&ctx, &options(&["omp:"])).unwrap();
+        assert!(installed_in(&custom));
+        unconfigure(&ctx).unwrap();
+        assert!(!installed_in(&neurable) && !installed_in(&custom));
+
+        // Auto-detected: every valid profile, one journal key per file.
+        configure(&ctx, &options(&[])).unwrap();
+        assert!(installed_in(&custom) && installed_in(&neurable));
+        assert!(!omp_extension_path(&h.join(".omp/agent")).exists(), "the overridden default dir");
+        assert!(!omp_extension_path(&h.join(".omp/profiles/Bad/agent")).exists(), "an invalid profile name");
+        assert_eq!(load_journal(&ctx.config_dir).len(), 4);
+        unconfigure(&ctx).unwrap();
+        assert!(!omp_extension_path(&neurable).exists() && !omp_skill_link(&neurable).is_symlink());
+        assert!(!omp_extension_path(&custom).exists());
     }
 }

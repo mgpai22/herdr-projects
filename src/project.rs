@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::paths::Env;
+
 pub const MAX_SLUG: usize = 40;
 pub const BODY_WARN_CHARS: usize = 16_000;
 
@@ -132,6 +134,11 @@ pub struct Settings {
     /// The profile a thread starts with when none is chosen.
     #[serde(alias = "thread_agent")]
     pub thread_profile: String,
+    /// Before profiles: the OMP profile an `omp` default launched with.
+    /// Read only; `parse_project_md` folds it into the defaults
+    /// (`legacy_omp_default`) and `set` rewrites it away.
+    #[serde(skip_serializing)]
+    pub omp_profile: String,
     pub max_parallel_threads: u32,
     pub auto_resolve_days: u32,
     pub nudge: bool,
@@ -147,6 +154,7 @@ impl Default for Settings {
             goal: String::new(),
             coordinator_profile: "claude".into(),
             thread_profile: "claude".into(),
+            omp_profile: String::new(),
             max_parallel_threads: 10,
             auto_resolve_days: 7,
             // On by default (W15): the ticker prompts only a coordinator that
@@ -171,8 +179,22 @@ pub fn parse_project_md(text: &str) -> Result<(Settings, String)> {
             .map(|front| (front, ""))
             .context("PROJECT.md front matter has no closing `+++` line")?,
     };
-    let settings: Settings = toml::from_str(front).context("PROJECT.md front matter does not parse")?;
+    let mut settings: Settings = toml::from_str(front).context("PROJECT.md front matter does not parse")?;
+    for default in [&mut settings.thread_profile, &mut settings.coordinator_profile] {
+        if let Some(migrated) = legacy_omp_default(default, &settings.omp_profile) {
+            *default = migrated;
+        }
+    }
     Ok((settings, body.trim_start_matches('\n').to_string()))
+}
+
+/// Before profiles, `omp_profile = "X"` gave an `omp` default OMP profile X:
+/// that default reads as the built-in profile `omp-X`. An X OMP refuses stays
+/// as written, so the name resolves to no profile and the launch fails where
+/// `doctor` and `thread start` show it, not under OMP's default profile.
+pub fn legacy_omp_default(default: &str, omp_profile: &str) -> Option<String> {
+    let name = crate::omp::normalize_profile(omp_profile).unwrap_or_else(|_| omp_profile.trim().to_string());
+    (default == "omp" && !name.is_empty()).then(|| format!("omp-{name}"))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
@@ -220,6 +242,9 @@ pub struct Coordinator {
     /// The profile it started with (empty before profiles: the built-in of
     /// `agent`). A resume or a reuse needs the same profile.
     pub profile: String,
+    /// The OMP profile it started with (the profile's `omp_profile`); empty
+    /// = default. A resume or a reuse needs the same one.
+    pub omp_profile: String,
     /// The last native session id Herdr reported for that kind, for resume.
     pub agent_session: String,
     pub updated: String,
@@ -324,7 +349,7 @@ impl Project {
     /// The canonical folder (symlinks resolved): the key of the project's
     /// `[safety]` table and of its routine approvals.
     pub fn canonical_dir(&self) -> PathBuf {
-        std::fs::canonicalize(self.dir()).unwrap_or_else(|_| self.dir())
+        crate::paths::canonicalize(self.dir()).unwrap_or_else(|_| self.dir())
     }
 
     /// Takes the per-project lock. The lock file is opened without creating
@@ -375,6 +400,15 @@ impl Project {
         record.updated = now();
         write_json(&self.state_dir().join("coordinator.json"), &record)?;
         Ok(record)
+    }
+
+    /// Removes `coordinator.json` under the lock: back to never opened.
+    pub fn remove_coordinator(&self) -> Result<()> {
+        let _lock = self.lock()?;
+        match std::fs::remove_file(self.state_dir().join("coordinator.json")) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        }
     }
 
     pub fn safety(&self, config_dir: &Path) -> Result<Safety> {
@@ -523,23 +557,56 @@ pub fn prefix_in_agents_md(text: &str) -> Option<String> {
 
 pub const PR_FOLLOWUP: &str = "routines/pr-followup.md";
 
-const PR_FOLLOWUP_TEMPLATE: &str = "+++\non = \"pr\"\nevents = [\"checks-failed\", \"review\"]\nenabled = true\n+++\n\nFix the failing checks and address the new review comments on your pull request. Read them with `gh`, push the fixes, reply where a reviewer asked something, and then rewrite your report. If a comment asks for something outside your task, say so in the report instead of doing it.\n";
+const PR_FOLLOWUP_TEMPLATE: &str = "+++\non = \"pr\"\nevents = [\"checks-failed\", \"review\"]\nenabled = true\n+++\n\nFix the failing checks and address the new review comments on your pull request. Read them with `gh`, push the fixes, reply where a reviewer asked something, and then rewrite your report. If a comment asks for something outside your task, say so in the report instead of doing it.\n\nAuthorized: push to this thread's branch and comment on this pull request only (replies to review comments; no merge, no new pull requests, no other branches).\n";
+
+/// Every default `routines/pr-followup.md` an earlier version wrote. A file
+/// with exactly one of these texts, its `enabled` line aside, was never
+/// edited, so `doctor --fix` replaces it.
+const PR_FOLLOWUP_SHIPPED: [&str; 1] = [
+    "+++\non = \"pr\"\nevents = [\"checks-failed\", \"review\"]\nenabled = true\n+++\n\nFix the failing checks and address the new review comments on your pull request. Read them with `gh`, push the fixes, reply where a reviewer asked something, and then rewrite your report. If a comment asks for something outside your task, say so in the report instead of doing it.\n",
+];
+
+/// The `enabled = …` line of an earlier default, when `text` is one: turning
+/// the routine off (`routine toggle`, the popup) is not an edit.
+fn earlier_pr_followup(text: &str) -> Option<&str> {
+    let line = text.lines().find(|l| l.starts_with("enabled = "))?;
+    PR_FOLLOWUP_SHIPPED.contains(&text.replacen(line, "enabled = true", 1).as_str()).then_some(line)
+}
 
 /// The ready-made `pr` routine (enabled by default; the popup or the
-/// coordinator turns it off). Written by `new` and by `doctor --fix` when
-/// missing.
+/// coordinator turns it off). Written by `new`, and by `doctor --fix` when
+/// missing or an unedited earlier default, whose `enabled` value it keeps.
 pub fn write_default_routine(project: &Project) -> Result<bool> {
     let path = project.dir().join(PR_FOLLOWUP);
-    if path.exists() {
-        return Ok(false);
-    }
-    write_atomic(&path, PR_FOLLOWUP_TEMPLATE.as_bytes())?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => match earlier_pr_followup(&text) {
+            Some(line) => PR_FOLLOWUP_TEMPLATE.replacen("enabled = true", line, 1),
+            None => return Ok(false),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PR_FOLLOWUP_TEMPLATE.to_string(),
+        Err(_) => return Ok(false),
+    };
+    write_atomic(&path, text.as_bytes())?;
     Ok(true)
 }
 
-/// Writes `AGENTS.md`, `CLAUDE.md` (a relative symbolic link to it) and
-/// creates `uploads/`. Idempotent; used by `new` and by `doctor --fix`.
-pub fn write_priming(project: &Project, prefix: &str) -> Result<()> {
+/// A note for `doctor` when an enabled `routines/pr-followup.md` was edited
+/// and has no `Authorized:` line: `doctor --fix` leaves it, and without the
+/// line an mstack thread will not push its fixes. An unedited earlier default
+/// is a `priming_problems` entry instead, which `--fix` repairs.
+pub fn pr_followup_note(project: &Project) -> Option<String> {
+    let text = std::fs::read_to_string(project.dir().join(PR_FOLLOWUP)).ok()?;
+    let line = PR_FOLLOWUP_TEMPLATE.lines().last().unwrap_or_default();
+    let disabled = crate::routine::parse("pr-followup", &text).is_ok_and(|routine| !routine.enabled);
+    (!text.contains("Authorized:") && earlier_pr_followup(&text).is_none() && !disabled)
+        .then(|| format!("routines/pr-followup.md is edited and has no `Authorized:` line, so `doctor --fix` leaves it; add `{line}` if its threads should push"))
+}
+
+/// Writes `AGENTS.md`, `CLAUDE.md` (a relative symbolic link to it),
+/// `.omp/config.yml`, `.mstack/config.yml` when mstack reads it, and creates
+/// `uploads/`. Idempotent; used by `new` and by `doctor --fix`. `config_dir`
+/// holds the config.toml with the coordinator's profile.
+pub fn write_priming(project: &Project, prefix: &str, env: &Env, config_dir: &Path) -> Result<()> {
     let dir = project.dir();
     let (settings, _) = project.read_project_md()?;
     let name = display_name(&settings.name, &project.slug);
@@ -557,7 +624,9 @@ pub fn write_priming(project: &Project, prefix: &str) -> Result<()> {
     let claude = dir.join("CLAUDE.md");
     let link_ok = std::fs::read_link(&claude).is_ok_and(|target| target == Path::new("AGENTS.md"));
     if !link_ok {
-        if std::fs::symlink_metadata(&claude).is_ok() {
+        if claude_is_our_copy(&claude) {
+            std::fs::remove_file(&claude)?;
+        } else if std::fs::symlink_metadata(&claude).is_ok() {
             // A regular file or a link elsewhere: keep its text beside it, once.
             let kept = dir.join("CLAUDE.md.before-herdr-projects");
             if !kept.exists() {
@@ -566,17 +635,231 @@ pub fn write_priming(project: &Project, prefix: &str) -> Result<()> {
                 std::fs::remove_file(&claude)?;
             }
         }
-        std::os::unix::fs::symlink("AGENTS.md", &claude).with_context(|| format!("could not link {}", claude.display()))?;
+        link_claude_md(&dir).with_context(|| format!("could not link {}", claude.display()))?;
     }
     if !dir.join("uploads").is_dir() {
         std::fs::create_dir(dir.join("uploads"))?;
     }
     write_default_routine(project)?;
+    // Only OMP reads these files: a failure here must not stop `open` or
+    // `doctor --fix` for other harnesses; `priming_problems` reports it.
+    let _ = write_omp_config(project, prefix, env, config_dir);
+    let mstack = dir.join(MSTACK_CONFIG);
+    if mstack_wanted(project, env, config_dir) {
+        let _ = write_managed(&mstack, &mstack_config());
+    } else if is_managed(&mstack) {
+        // An mstack before 0.4.0 refuses the whole file over `mode`.
+        let _ = std::fs::remove_file(&mstack);
+    }
     Ok(())
 }
 
+/// `CLAUDE.md -> AGENTS.md`. Windows without the symbolic-link privilege
+/// (Developer Mode off) gets a copy instead, refreshed on every write.
+fn link_claude_md(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("AGENTS.md", dir.join("CLAUDE.md"))
+    }
+    #[cfg(windows)]
+    {
+        const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+        match std::os::windows::fs::symlink_file("AGENTS.md", dir.join("CLAUDE.md")) {
+            Err(e) if e.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => {
+                eprintln!("herdr-projects: no symbolic link privilege; {} is a copy of AGENTS.md", dir.join("CLAUDE.md").display());
+                std::fs::copy(dir.join("AGENTS.md"), dir.join("CLAUDE.md")).map(drop)
+            }
+            other => other,
+        }
+    }
+}
+
+/// A regular `CLAUDE.md` written as a copy by `link_claude_md` (Windows only).
+fn claude_is_our_copy(claude: &Path) -> bool {
+    cfg!(windows) && std::fs::symlink_metadata(claude).is_ok_and(|m| m.is_file()) && std::fs::read_to_string(claude).is_ok_and(|t| t.contains("Written by herdr-projects"))
+}
+
+/// `CLAUDE.md` links to `AGENTS.md`, or is our up-to-date copy of it.
+fn claude_md_ok(dir: &Path) -> bool {
+    let claude = dir.join("CLAUDE.md");
+    std::fs::read_link(&claude).is_ok_and(|t| t == Path::new("AGENTS.md"))
+        || (claude_is_our_copy(&claude) && std::fs::read(&claude).ok() == std::fs::read(dir.join("AGENTS.md")).ok())
+}
+
+pub const OMP_CONFIG: &str = ".omp/config.yml";
+pub const OMP_CONFIG_MARKER: &str = "# herdr-projects: managed";
+
+/// OMP layers `<cwd>/.omp/config.yml` (no walk-up) over the user's config, and
+/// only the coordinator runs in exactly this folder. A
+/// `deny` or `prompt` pattern holds even under `approvalMode: yolo`, but only
+/// for the bash tool: `eval` and `debug` can reach a shell too, hence their own
+/// `prompt`. OMP replaces arrays whole, so this list would replace the global
+/// `bash.patterns` of the coordinator's profile: `extra` copies them after
+/// ours (None: that profile's config could not be read). OMP takes the first
+/// rule that matches the command or any part of it, so the profile's `deny`
+/// rules also come before our `prompt` rules: confirming `thread resolve` in
+/// `… thread resolve x && gh pr merge 1` must not let a denied merge run.
+/// Every rule starts with the exact
+/// prefix the coordinator is told to use, so a heredoc body or a slug such as
+/// `configure-ci` never matches. Advice-level, like COORDINATOR.md: a wrapped
+/// or renamed binary evades it.
+// ponytail: a quoted prefix (a path with spaces) misses OMP's per-segment
+// check, which strips quotes; `cd x && <prefix> configure` then passes.
+fn omp_config(prefix: &str, profile: &str, extra: Option<&[crate::omp::PatternRule]>) -> String {
+    let deny = [
+        "routine approve *",
+        "configure",
+        "configure *",
+        "unconfigure",
+        "unconfigure *",
+        "safety yolo *",
+        "safety set *",
+        "profile add *",
+        "profile edit *",
+        "profile remove *",
+        "profile allow *",
+        "profile default *",
+    ];
+    let prompt = ["thread resolve *", "sweep", "sweep *", "archive *", "delete *"];
+    let mut text = format!(
+        "{OMP_CONFIG_MARKER}. `doctor --fix` rewrites this file; delete this line to keep your own edits.\n\
+         # The coordinator never runs these itself; resolve, sweep, archive and delete wait for you to confirm.\n"
+    );
+    if extra.is_none() {
+        text.push_str("# profile config unreadable: only the herdr-projects rules apply; `doctor` names the error.\n");
+    }
+    text.push_str("tools:\n  approval:\n    eval: prompt\n    debug: prompt\nbash:\n  patterns:\n");
+    // A JSON string is a valid YAML double-quoted scalar.
+    let rule = |text: &mut String, matcher: &str, approval: &str| {
+        text.push_str(&format!("    - match: {}\n      approval: {approval}\n", serde_json::to_string(matcher).expect("a string serializes")));
+    };
+    for sub in deny {
+        rule(&mut text, &format!("{prefix} {sub}"), "deny");
+    }
+    let extra = extra.unwrap_or_default();
+    let name = if profile.is_empty() { "default" } else { profile };
+    let denied: Vec<_> = extra.iter().filter(|r| r.approval == "deny").collect();
+    if !denied.is_empty() {
+        text.push_str(&format!("    # The deny rules of OMP profile {name}, again before the confirmations below.\n"));
+    }
+    for r in denied {
+        rule(&mut text, &r.matcher, "deny");
+    }
+    for sub in prompt {
+        rule(&mut text, &format!("{prefix} {sub}"), "prompt");
+    }
+    if !extra.is_empty() {
+        text.push_str(&format!("    # The global bash.patterns of OMP profile {name}, which this list would otherwise replace.\n"));
+    }
+    for r in extra {
+        rule(&mut text, &r.matcher, &r.approval);
+    }
+    text
+}
+
+/// The coordinator's OMP profile: the one the recorded OMP coordinator runs
+/// under (`open` and the ticker keep it current), else the `omp_profile` of
+/// the project's `coordinator_profile` (empty for another harness);
+/// normalized.
+fn coordinator_profile(project: &Project, config_dir: &Path) -> Result<String> {
+    if let Some(record) = project.coordinator().filter(|record| record.agent == "omp") {
+        return crate::omp::normalize_profile(&record.omp_profile);
+    }
+    let (settings, _) = project.read_project_md()?;
+    let config = crate::profiles::load(config_dir)?;
+    let profile = config.get(&settings.coordinator_profile).with_context(|| format!("there is no profile `{}`", settings.coordinator_profile))?;
+    Ok(if profile.agent() == "omp" { profile.entry.omp_profile } else { String::new() })
+}
+
+/// How every `priming_problems` note about the coordinator's profile starts.
+pub const PROFILE_PROBLEM: &str = "the coordinator's OMP profile";
+
+/// What `.omp/config.yml` should hold, and why the profile's rules are
+/// missing from it, if they are.
+fn wanted_omp_config(project: &Project, prefix: &str, env: &Env, config_dir: &Path) -> (String, Option<String>) {
+    // A recorded OMP coordinator's profile wins over the setting, so while
+    // one is recorded only a coordinator started under another profile helps.
+    let other = if project.coordinator().is_some_and(|record| record.agent == "omp") {
+        format!("start the coordinator under another profile with `open {} --profile <name>`", project.slug)
+    } else {
+        format!("run `set {} coordinator_profile <profile>` to use another profile", project.slug)
+    };
+    let only_ours = ".omp/config.yml has only the herdr-projects rules";
+    let profile = match coordinator_profile(project, config_dir) {
+        Ok(profile) => profile,
+        Err(error) => return (omp_config(prefix, "", None), Some(format!("{PROFILE_PROBLEM} is invalid ({error:#}); {only_ours}; {other}"))),
+    };
+    match crate::omp::bash_patterns(env, &profile) {
+        // A named profile with no agent directory here is a typo or another
+        // machine's: herdr refuses to launch it (`unknown_launch_profile`).
+        Ok(rules) if !profile.is_empty() && !crate::omp::agent_dir(env, &profile).is_dir() => {
+            let dir = crate::omp::agent_dir(env, &profile);
+            (omp_config(prefix, &profile, Some(rules.as_slice())), Some(format!("{PROFILE_PROBLEM} `{profile}` has no agent directory on this machine ({}); {only_ours}; create that profile in OMP, or {other}", dir.display())))
+        }
+        Ok(rules) => (omp_config(prefix, &profile, Some(rules.as_slice())), None),
+        Err(error) => {
+            let path = crate::omp::config_path(env, &profile).map(|p| p.display().to_string()).unwrap_or_default();
+            (omp_config(prefix, "", None), Some(format!("{PROFILE_PROBLEM} config is not usable ({error:#}); {only_ours}; fix {path}, or {other}")))
+        }
+    }
+}
+
+/// Writes `.omp/config.yml` when it is missing or an out-of-date managed file.
+/// Returns whether it wrote.
+pub fn write_omp_config(project: &Project, prefix: &str, env: &Env, config_dir: &Path) -> Result<bool> {
+    write_managed(&project.dir().join(OMP_CONFIG), &wanted_omp_config(project, prefix, env, config_dir).0)
+}
+
+pub const MSTACK_CONFIG: &str = ".mstack/config.yml";
+
+/// mstack layers `<cwd>/.mstack/config.yml` over its user file. The
+/// coordinator gets everything as queued messages, which never run `/mstack
+/// on`, so this file starts its sessions with mstack mode on. mstack skills
+/// promote their records under `promotion.directory`, which would be
+/// `.mstack/`; the coordinator may write only `scratch/`.
+fn mstack_config() -> String {
+    format!("{OMP_CONFIG_MARKER}. `doctor --fix` rewrites this file; delete this line to keep your own edits.\nmode: true\npromotion:\n  directory: scratch/mstack\n")
+}
+
+/// Whether the coordinator's OMP profile has an enabled mstack that reads
+/// `mode` (0.4.0 and later).
+fn mstack_wanted(project: &Project, env: &Env, config_dir: &Path) -> bool {
+    coordinator_profile(project, config_dir).is_ok_and(|profile| crate::omp::mstack_version(env, &profile).is_some_and(|version| version >= (0, 4, 0)))
+}
+
+/// True when `path` is a file we manage (our marker on line 1).
+fn is_managed(path: &Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|text| text.starts_with(OMP_CONFIG_MARKER))
+}
+
+/// Writes a managed file when it is missing or an out-of-date managed copy.
+/// A file without our marker, or one that cannot be read, is left alone (the
+/// user's own config is never overwritten). Returns whether it wrote.
+fn write_managed(path: &Path, wanted: &str) -> Result<bool> {
+    match std::fs::read_to_string(path) {
+        Ok(text) if text == wanted || !text.starts_with(OMP_CONFIG_MARKER) => return Ok(false),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Ok(false),
+    }
+    std::fs::create_dir_all(path.parent().context("path has no parent")?)?;
+    write_atomic(path, wanted.as_bytes())?;
+    Ok(true)
+}
+
+/// What is wrong with a managed file `rel` in `dir`, if anything.
+fn managed_problem(dir: &Path, rel: &str, wanted: &str) -> Option<String> {
+    match std::fs::read_to_string(dir.join(rel)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(format!("{rel} is missing")),
+        Err(error) => Some(format!("{rel} cannot be read ({error})")),
+        Ok(text) if text.starts_with(OMP_CONFIG_MARKER) && text != wanted => Some(format!("{rel} is out of date")),
+        // The user's own file (no marker) is theirs to keep.
+        Ok(_) => None,
+    }
+}
+
 /// What `doctor` finds wrong with a project's priming files, as short notes.
-pub fn priming_problems(project: &Project, prefix: &str) -> Vec<String> {
+pub fn priming_problems(project: &Project, prefix: &str, env: &Env, config_dir: &Path) -> Vec<String> {
     let dir = project.dir();
     let mut problems = Vec::new();
     match std::fs::read_to_string(dir.join("AGENTS.md")) {
@@ -593,14 +876,28 @@ pub fn priming_problems(project: &Project, prefix: &str) -> Vec<String> {
             }
         },
     }
-    if !std::fs::read_link(dir.join("CLAUDE.md")).is_ok_and(|t| t == Path::new("AGENTS.md")) {
+    if !claude_md_ok(&dir) {
         problems.push("CLAUDE.md is not a link to AGENTS.md".into());
     }
     if !dir.join("uploads").is_dir() {
         problems.push("uploads/ is missing".into());
     }
-    if !dir.join(PR_FOLLOWUP).exists() {
-        problems.push("routines/pr-followup.md is missing".into());
+    match std::fs::read_to_string(dir.join(PR_FOLLOWUP)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => problems.push("routines/pr-followup.md is missing".into()),
+        Ok(text) if earlier_pr_followup(&text).is_some() => problems.push("routines/pr-followup.md is an earlier default, without the `Authorized:` line".into()),
+        _ => {}
+    }
+    let (wanted, profile_problem) = wanted_omp_config(project, prefix, env, config_dir);
+    problems.extend(managed_problem(&dir, OMP_CONFIG, &wanted));
+    if let Some(problem) = profile_problem
+        && is_managed(&dir.join(OMP_CONFIG))
+    {
+        problems.push(problem);
+    }
+    if mstack_wanted(project, env, config_dir) {
+        problems.extend(managed_problem(&dir, MSTACK_CONFIG, &mstack_config()));
+    } else if is_managed(&dir.join(MSTACK_CONFIG)) {
+        problems.push(format!("{MSTACK_CONFIG} is no longer wanted"));
     }
     problems
 }
@@ -623,7 +920,7 @@ pub fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<P
             // A remote path is stored as it is on its own machine.
             Some(_) => repo,
             None => Repo {
-                path: std::fs::canonicalize(&repo.path)
+                path: crate::paths::canonicalize(&repo.path)
                     .or_else(|_| std::path::absolute(&repo.path))
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or(repo.path),
@@ -650,6 +947,10 @@ pub fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<P
     )?;
     write_atomic(&dir.join("TASKS.md"), TASKS_TEMPLATE.as_bytes())?;
     write_atomic(&dir.join(PR_FOLLOWUP), PR_FOLLOWUP_TEMPLATE.as_bytes())?;
+    // The same prefix AGENTS.md and COORDINATOR.md tell the coordinator to use.
+    // PROJECT.md does not exist yet: `write_priming`, which runs before any
+    // coordinator starts, adds the profile's rules and `.mstack/config.yml`.
+    write_managed(&dir.join(OMP_CONFIG), &omp_config(&crate::coordinator::current_prefix(root)?, "", Some(&[])))?;
     write_json(&project.state_dir().join("project.json"), &ProjectState::default())?;
     // PROJECT.md last: a folder without it is not a project, so a half-made
     // skeleton is never picked up by `list` or the ticker.
@@ -663,6 +964,21 @@ pub fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The priming calls below read profiles from the production config dir,
+    // `env.config_dir()`; `a_user_profiles_omp_profile_is_read_from_the_given_config_dir`
+    // passes another one.
+    fn write_priming(project: &Project, prefix: &str, env: &Env) -> Result<()> {
+        super::write_priming(project, prefix, env, &env.config_dir())
+    }
+
+    fn priming_problems(project: &Project, prefix: &str, env: &Env) -> Vec<String> {
+        super::priming_problems(project, prefix, env, &env.config_dir())
+    }
+
+    fn write_omp_config(project: &Project, prefix: &str, env: &Env) -> Result<bool> {
+        super::write_omp_config(project, prefix, env, &env.config_dir())
+    }
 
     #[test]
     fn only_folders_with_project_md_count() {
@@ -751,7 +1067,7 @@ mod tests {
             settings.repos,
             vec![
                 Repo { path: "/srv/app".into(), machine: Some("box".into()) },
-                Repo { path: "/no/such/repo".into(), machine: None },
+                Repo { path: std::path::absolute("/no/such/repo").unwrap().to_string_lossy().into_owned(), machine: None },
             ]
         );
         assert!(body.starts_with("# Instructions"));
@@ -762,9 +1078,11 @@ mod tests {
     #[test]
     fn priming_files_are_written_linked_and_checked() {
         let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
         let project = create(root.path(), "Demo Project", "", vec![]).unwrap();
         let prefix = format!("{} --root {}", std::env::current_exe().unwrap().display(), root.path().display());
-        write_priming(&project, &prefix).unwrap();
+        write_priming(&project, &prefix, &env).unwrap();
         let text = std::fs::read_to_string(project.dir().join("AGENTS.md")).unwrap();
         assert!(text.contains("you are the coordinator of Demo Project"));
         assert!(text.contains(&format!("`{prefix} skill`")));
@@ -773,29 +1091,438 @@ mod tests {
         assert_eq!(prefix_in_agents_md(&text).as_deref(), Some(prefix.as_str()));
         assert_eq!(std::fs::read_link(project.dir().join("CLAUDE.md")).unwrap(), Path::new("AGENTS.md"));
         assert!(project.dir().join("uploads").is_dir());
-        assert!(priming_problems(&project, &prefix).is_empty());
+        assert!(priming_problems(&project, &prefix, &env).is_empty());
 
         // Idempotent, and a stale binary path is reported.
-        write_priming(&project, &prefix).unwrap();
+        write_priming(&project, &prefix, &env).unwrap();
         let stale = agents_md("Demo Project", "demo-project", "/no/such/binary --root /r");
         std::fs::write(project.dir().join("AGENTS.md"), stale).unwrap();
-        let problems = priming_problems(&project, &prefix);
+        let problems = priming_problems(&project, &prefix, &env);
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("does not exist"));
-        write_priming(&project, &prefix).unwrap();
-        assert!(priming_problems(&project, &prefix).is_empty());
+        write_priming(&project, &prefix, &env).unwrap();
+        assert!(priming_problems(&project, &prefix, &env).is_empty());
 
         // A foreign AGENTS.md is kept beside ours.
         std::fs::write(project.dir().join("AGENTS.md"), "codex notes").unwrap();
-        write_priming(&project, &prefix).unwrap();
+        write_priming(&project, &prefix, &env).unwrap();
         assert_eq!(std::fs::read_to_string(project.dir().join("AGENTS.md.before-herdr-projects")).unwrap(), "codex notes");
         // A hand-written CLAUDE.md is kept beside the link, not lost.
         std::fs::remove_file(project.dir().join("CLAUDE.md")).unwrap();
         std::fs::write(project.dir().join("CLAUDE.md"), "mine").unwrap();
-        assert!(priming_problems(&project, &prefix).iter().any(|p| p.contains("CLAUDE.md")));
-        write_priming(&project, &prefix).unwrap();
+        assert!(priming_problems(&project, &prefix, &env).iter().any(|p| p.contains("CLAUDE.md")));
+        write_priming(&project, &prefix, &env).unwrap();
         assert_eq!(std::fs::read_to_string(project.dir().join("CLAUDE.md.before-herdr-projects")).unwrap(), "mine");
-        assert!(priming_problems(&project, &prefix).is_empty());
+        assert!(priming_problems(&project, &prefix, &env).is_empty());
+
+        // Windows without the symlink privilege: our copy counts while it is
+        // current; a stale one is reported and replaced, never kept aside.
+        #[cfg(windows)]
+        {
+            let claude = project.dir().join("CLAUDE.md");
+            std::fs::remove_file(&claude).unwrap();
+            std::fs::copy(project.dir().join("AGENTS.md"), &claude).unwrap();
+            assert!(priming_problems(&project, &prefix, &env).is_empty());
+            let stale = format!("{}\nolder text\n", std::fs::read_to_string(&claude).unwrap());
+            std::fs::write(&claude, stale).unwrap();
+            assert!(priming_problems(&project, &prefix, &env).iter().any(|p| p.contains("CLAUDE.md")));
+            write_priming(&project, &prefix, &env).unwrap();
+            assert_eq!(std::fs::read_link(&claude).unwrap(), Path::new("AGENTS.md"));
+            assert_eq!(std::fs::read_to_string(project.dir().join("CLAUDE.md.before-herdr-projects")).unwrap(), "mine");
+        }
+    }
+
+    #[test]
+    fn omp_config_is_written_refreshed_and_never_replaces_a_foreign_file() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let project = create(root.path(), "demo", "", vec![]).unwrap();
+        let prefix = crate::coordinator::current_prefix(root.path()).unwrap();
+        let path = project.dir().join(OMP_CONFIG);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), omp_config(&prefix, "", Some(&[])), "`create` writes it for the coordinator's prefix");
+        std::fs::remove_file(&path).unwrap();
+        assert!(priming_problems(&project, &prefix, &env).iter().any(|p| p.contains(".omp/config.yml is missing")));
+        write_priming(&project, &prefix, &env).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), omp_config(&prefix, "", Some(&[])));
+        assert!(priming_problems(&project, &prefix, &env).is_empty());
+        assert!(!write_omp_config(&project, &prefix, &env).unwrap(), "a current file is left alone");
+
+        // An older managed file, or one for another binary or root, is reported and rewritten.
+        std::fs::write(&path, format!("{OMP_CONFIG_MARKER}\nbash: {{}}\n")).unwrap();
+        assert!(priming_problems(&project, &prefix, &env).iter().any(|p| p.contains("out of date")));
+        assert!(write_omp_config(&project, &prefix, &env).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), omp_config(&prefix, "", Some(&[])));
+        assert!(priming_problems(&project, "/other/hp --root /r", &env).iter().any(|p| p.contains("out of date")));
+
+        // The user's own config (marker removed) is theirs: kept and not a problem.
+        std::fs::write(&path, "tools:\n  approvalMode: yolo\n").unwrap();
+        write_priming(&project, &prefix, &env).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "tools:\n  approvalMode: yolo\n");
+        assert!(priming_problems(&project, &prefix, &env).is_empty());
+
+        // A file that cannot be read as text is never replaced.
+        std::fs::write(&path, b"\xff\xfe").unwrap();
+        write_priming(&project, &prefix, &env).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"\xff\xfe");
+        assert!(priming_problems(&project, &prefix, &env).iter().any(|p| p.contains("cannot be read")));
+
+        // A directory in the way is left alone too.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        write_priming(&project, &prefix, &env).unwrap();
+        assert!(path.is_dir());
+
+        // A failed write does not fail the other priming files (`open` for any harness).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let omp = project.dir().join(".omp");
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o500)).unwrap();
+            std::fs::remove_file(project.dir().join("AGENTS.md")).unwrap();
+            let result = write_priming(&project, &prefix, &env);
+            std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o700)).unwrap();
+            result.unwrap();
+            assert!(project.dir().join("AGENTS.md").is_file());
+        }
+    }
+
+    #[test]
+    fn omp_config_keeps_the_coordinator_profiles_patterns_after_ours() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let project = create(root.path(), "demo", "", vec![]).unwrap();
+        let prefix = crate::coordinator::current_prefix(root.path()).unwrap();
+        let path = project.dir().join(OMP_CONFIG);
+        let set_profile = |name: &str| {
+            let text = std::fs::read_to_string(project.project_md()).unwrap();
+            std::fs::write(project.project_md(), crate::settings::set_in(&text, "coordinator_profile", name).unwrap()).unwrap();
+        };
+        set_profile("omp-neurable");
+        let agent = home.path().join(".omp/profiles/neurable/agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(home.path().join(".omp/agent")).unwrap();
+        std::fs::write(home.path().join(".omp/agent/config.yml"), "bash:\n  patterns:\n    - match: \"*rm -rf*\"\n      approval: deny\n").unwrap();
+        std::fs::write(agent.join("config.yml"), "bash:\n  patterns:\n    - match: \"*gh pr merge*\"\n      approval: deny\n    - match: \"*\"\n      approval: prompt\n").unwrap();
+        assert!(priming_problems(&project, &prefix, &env).iter().any(|p| p.contains("out of date")), "`create` wrote ours only");
+        write_priming(&project, &prefix, &env).unwrap();
+        let config = std::fs::read_to_string(&path).unwrap();
+        // Ours come first, so the profile's catch-all never shadows them.
+        assert_eq!(omp_approval(&config, &format!("{prefix} configure")).as_deref(), Some("deny"));
+        assert_eq!(omp_approval(&config, "gh pr merge 7").as_deref(), Some("deny"));
+        assert_eq!(omp_approval(&config, "ls").as_deref(), Some("prompt"));
+        assert_eq!(omp_approval(&config, "rm -rf /tmp/x").as_deref(), Some("prompt"), "another profile's rules stay out");
+        // Confirming a resolve never lets a command the profile denies ride along.
+        assert_eq!(omp_approval(&config, &format!("{prefix} thread resolve demo t-0001 && gh pr merge 42 --squash")).as_deref(), Some("deny"));
+        assert_eq!(omp_approval(&config, &format!("{prefix} thread resolve demo t-0001")).as_deref(), Some("prompt"));
+        assert!(priming_problems(&project, &prefix, &env).is_empty());
+
+        // An edit to the profile's config makes the file out of date.
+        std::fs::write(agent.join("config.yml"), "bash:\n  patterns:\n    - match: \"*gh pr merge*\"\n      approval: deny\n").unwrap();
+        assert!(priming_problems(&project, &prefix, &env).iter().any(|p| p.contains("out of date")));
+        write_priming(&project, &prefix, &env).unwrap();
+        let config = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(omp_approval(&config, "ls"), None);
+        assert_eq!(omp_approval(&config, "gh pr merge 7").as_deref(), Some("deny"));
+
+        // An unreadable profile config leaves ours only, and doctor says why and where.
+        std::fs::write(agent.join("config.yml"), b"\xff\xfe").unwrap();
+        write_priming(&project, &prefix, &env).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), omp_config(&prefix, "", None));
+        let problems = priming_problems(&project, &prefix, &env);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].starts_with(PROFILE_PROBLEM) && problems[0].contains(&format!("fix {}", crate::omp::agent_dir(&env, "neurable").join("config.yml").display())), "{problems:?}");
+
+        // So does a profile name OMP would refuse.
+        std::fs::write(agent.join("config.yml"), "bash:\n  patterns: []\n").unwrap();
+        set_profile("omp-Bad");
+        write_priming(&project, &prefix, &env).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), omp_config(&prefix, "", None));
+        assert!(priming_problems(&project, &prefix, &env).iter().any(|p| p.starts_with(PROFILE_PROBLEM) && p.contains("`set demo coordinator_profile <profile>`")));
+
+        // The user's own file is still theirs, and the profile error is not reported for it.
+        std::fs::write(&path, "tools: {}\n").unwrap();
+        write_priming(&project, &prefix, &env).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "tools: {}\n");
+        assert!(priming_problems(&project, &prefix, &env).is_empty());
+    }
+
+    #[test]
+    fn a_user_profiles_omp_profile_is_read_from_the_given_config_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let project = create(root.path(), "demo", "", vec![]).unwrap();
+        let prefix = crate::coordinator::current_prefix(root.path()).unwrap();
+        let text = std::fs::read_to_string(project.project_md()).unwrap();
+        std::fs::write(project.project_md(), crate::settings::set_in(&text, "coordinator_profile", "nx").unwrap()).unwrap();
+        let agent = home.path().join(".omp/profiles/neurable/agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(agent.join("config.yml"), "bash:\n  patterns:\n    - match: \"*gh pr merge*\"\n      approval: deny\n").unwrap();
+        // `nx` lives in this config dir only, not in `env.config_dir()`.
+        let config_dir = home.path().join("cfg");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("config.toml"), "[profiles.nx]\nagent = \"omp\"\nomp_profile = \"neurable\"\n").unwrap();
+        super::write_priming(&project, &prefix, &env, &config_dir).unwrap();
+        let config = std::fs::read_to_string(project.dir().join(OMP_CONFIG)).unwrap();
+        assert_eq!(omp_approval(&config, "gh pr merge 7").as_deref(), Some("deny"));
+        assert!(super::priming_problems(&project, &prefix, &env, &config_dir).is_empty());
+        assert!(priming_problems(&project, &prefix, &env).iter().any(|p| p.contains("there is no profile `nx`")), "another config dir has no `nx`");
+    }
+
+    #[test]
+    fn an_omp_profile_without_an_agent_directory_here_is_reported() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let project = create(root.path(), "demo", "", vec![]).unwrap();
+        let prefix = crate::coordinator::current_prefix(root.path()).unwrap();
+        let text = std::fs::read_to_string(project.project_md()).unwrap();
+        std::fs::write(project.project_md(), crate::settings::set_in(&text, "coordinator_profile", "omp-typo").unwrap()).unwrap();
+        write_priming(&project, &prefix, &env).unwrap();
+        assert_eq!(std::fs::read_to_string(project.dir().join(OMP_CONFIG)).unwrap(), omp_config(&prefix, "typo", Some(&[])));
+        let problems = priming_problems(&project, &prefix, &env);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].starts_with(PROFILE_PROBLEM) && problems[0].contains("`typo` has no agent directory") && problems[0].contains("coordinator_profile <profile>"), "{problems:?}");
+        std::fs::create_dir_all(crate::omp::agent_dir(&env, "typo")).unwrap();
+        assert!(priming_problems(&project, &prefix, &env).is_empty());
+    }
+
+    #[test]
+    fn priming_follows_the_profile_the_recorded_omp_coordinator_runs_under() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let project = create(root.path(), "demo", "", vec![]).unwrap();
+        let prefix = crate::coordinator::current_prefix(root.path()).unwrap();
+        let omp = home.path().join(".omp");
+        std::fs::create_dir_all(omp.join("agent")).unwrap();
+        std::fs::create_dir_all(omp.join("profiles/neurable/agent")).unwrap();
+        std::fs::write(omp.join("profiles/neurable/agent/config.yml"), "bash:\n  patterns:\n    - match: \"*gh *pr merge*\"\n      approval: deny\n").unwrap();
+        // mstack 0.4.0 is enabled for neurable only.
+        let plugins = omp.join("profiles/neurable/plugins");
+        std::fs::create_dir_all(plugins.join("node_modules/@mgpai22/mstack")).unwrap();
+        std::fs::write(plugins.join("node_modules/@mgpai22/mstack/package.json"), r#"{"version":"0.4.0"}"#).unwrap();
+        std::fs::write(plugins.join("omp-plugins.lock.json"), r#"{"plugins":{"@mgpai22/mstack":{"enabled":true}}}"#).unwrap();
+        let config = || std::fs::read_to_string(project.dir().join(OMP_CONFIG)).unwrap();
+        let mstack = project.dir().join(MSTACK_CONFIG);
+
+        // The project setting is the default profile, but the coordinator runs neurable.
+        project.update_coordinator(|c| {
+            c.agent = "omp".into();
+            c.omp_profile = "neurable".into();
+        })
+        .unwrap();
+        assert!(priming_problems(&project, &prefix, &env).iter().any(|p| p == ".omp/config.yml is out of date"));
+        write_priming(&project, &prefix, &env).unwrap();
+        assert_eq!(omp_approval(&config(), "gh pr merge 7").as_deref(), Some("deny"));
+        assert!(mstack.is_file());
+        assert!(priming_problems(&project, &prefix, &env).is_empty());
+
+        // Its config broken: the setting cannot help while the record wins, `open --profile` can.
+        let neurable = omp.join("profiles/neurable/agent/config.yml");
+        let good = std::fs::read(&neurable).unwrap();
+        std::fs::write(&neurable, b"\xff\xfe").unwrap();
+        let problems = priming_problems(&project, &prefix, &env);
+        assert!(problems.iter().any(|p| p.starts_with(PROFILE_PROBLEM) && p.ends_with("or start the coordinator under another profile with `open demo --profile <name>`")), "{problems:?}");
+        assert!(!problems.iter().any(|p| p.contains("coordinator_profile <profile>")), "{problems:?}");
+        std::fs::write(&neurable, good).unwrap();
+
+        // Another harness: back to the project setting, which has neither.
+        project.update_coordinator(|c| c.agent = "claude".into()).unwrap();
+        let problems = priming_problems(&project, &prefix, &env);
+        assert!(problems.contains(&".omp/config.yml is out of date".to_string()) && problems.contains(&".mstack/config.yml is no longer wanted".to_string()), "{problems:?}");
+        write_priming(&project, &prefix, &env).unwrap();
+        assert_eq!(omp_approval(&config(), "gh pr merge 7"), None);
+        assert!(!mstack.exists(), "a managed copy nobody wants is removed");
+        assert!(priming_problems(&project, &prefix, &env).is_empty());
+    }
+
+    #[test]
+    fn mstack_config_turns_mode_on_only_when_the_coordinators_mstack_reads_it() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let project = create(root.path(), "demo", "", vec![]).unwrap();
+        let prefix = crate::coordinator::current_prefix(root.path()).unwrap();
+        let path = project.dir().join(MSTACK_CONFIG);
+        let plugins = home.path().join(".omp/plugins");
+        let package = plugins.join("node_modules/@mgpai22/mstack");
+        std::fs::create_dir_all(&package).unwrap();
+        let lock = |enabled: bool| std::fs::write(plugins.join("omp-plugins.lock.json"), format!(r#"{{"plugins":{{"@mgpai22/mstack":{{"enabled":{enabled}}}}}}}"#)).unwrap();
+        lock(true);
+        std::fs::write(package.join("package.json"), r#"{"version":"0.3.0"}"#).unwrap();
+        write_priming(&project, &prefix, &env).unwrap();
+        assert!(!path.exists(), "0.3.0 has no `mode` key");
+        assert!(priming_problems(&project, &prefix, &env).is_empty());
+
+        std::fs::write(package.join("package.json"), r#"{"version":"0.4.0"}"#).unwrap();
+        assert!(priming_problems(&project, &prefix, &env).contains(&".mstack/config.yml is missing".to_string()));
+        write_priming(&project, &prefix, &env).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(OMP_CONFIG_MARKER) && text.lines().any(|l| l == "mode: true"), "{text}");
+        assert!(text.contains("promotion:\n  directory: scratch/mstack\n"), "mstack records go where the coordinator may write: {text}");
+        assert!(priming_problems(&project, &prefix, &env).is_empty());
+
+        // A stale managed copy is rewritten; the user's own file is kept.
+        std::fs::write(&path, format!("{OMP_CONFIG_MARKER}\nmode: false\n")).unwrap();
+        assert!(priming_problems(&project, &prefix, &env).contains(&".mstack/config.yml is out of date".to_string()));
+        write_priming(&project, &prefix, &env).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        std::fs::write(&path, "mode: false\n").unwrap();
+        write_priming(&project, &prefix, &env).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mode: false\n");
+        assert!(priming_problems(&project, &prefix, &env).is_empty());
+
+        // A disabled mstack, or one in another profile, wants no file: a
+        // managed copy is removed, the user's own is kept.
+        std::fs::write(&path, &text).unwrap();
+        lock(false);
+        assert!(priming_problems(&project, &prefix, &env).contains(&".mstack/config.yml is no longer wanted".to_string()));
+        write_priming(&project, &prefix, &env).unwrap();
+        assert!(!path.exists());
+        assert!(priming_problems(&project, &prefix, &env).is_empty());
+        std::fs::write(&path, "mode: true\n").unwrap();
+        write_priming(&project, &prefix, &env).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mode: true\n");
+        assert!(priming_problems(&project, &prefix, &env).is_empty());
+        std::fs::remove_file(&path).unwrap();
+        lock(true);
+        let text = std::fs::read_to_string(project.project_md()).unwrap();
+        std::fs::write(project.project_md(), crate::settings::set_in(&text, "coordinator_profile", "omp-neurable").unwrap()).unwrap();
+        write_priming(&project, &prefix, &env).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_unedited_earlier_pr_followup_default_is_replaced_and_an_edited_one_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let project = create(root.path(), "demo", "", vec![]).unwrap();
+        let prefix = crate::coordinator::current_prefix(root.path()).unwrap();
+        let path = project.dir().join(PR_FOLLOWUP);
+        assert_eq!(pr_followup_note(&project), None);
+
+        std::fs::write(&path, PR_FOLLOWUP_SHIPPED[0]).unwrap();
+        assert!(priming_problems(&project, &prefix, &env).iter().any(|p| p.contains("earlier default")));
+        assert_eq!(pr_followup_note(&project), None, "`--fix` repairs it");
+        write_priming(&project, &prefix, &env).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), PR_FOLLOWUP_TEMPLATE);
+        assert!(priming_problems(&project, &prefix, &env).is_empty());
+
+        // Turned off, it is still unedited: refreshed with its `enabled` value kept.
+        let off = PR_FOLLOWUP_SHIPPED[0].replace("enabled = true", "enabled = false");
+        std::fs::write(&path, &off).unwrap();
+        assert!(priming_problems(&project, &prefix, &env).iter().any(|p| p.contains("earlier default")));
+        write_priming(&project, &prefix, &env).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), PR_FOLLOWUP_TEMPLATE.replace("enabled = true", "enabled = false"));
+        assert_eq!(pr_followup_note(&project), None);
+
+        let edited = PR_FOLLOWUP_SHIPPED[0].replace("Fix the failing checks", "Fix the checks");
+        std::fs::write(&path, &edited).unwrap();
+        write_priming(&project, &prefix, &env).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        assert!(priming_problems(&project, &prefix, &env).is_empty());
+        assert!(pr_followup_note(&project).is_some_and(|note| note.contains("Authorized: push to this thread's branch")));
+        // An edited routine that is off sends nothing: no note.
+        std::fs::write(&path, edited.replace("enabled = true", "enabled = false")).unwrap();
+        assert_eq!(pr_followup_note(&project), None);
+        std::fs::write(&path, format!("{edited}\nAuthorized: push to this thread's branch only.\n")).unwrap();
+        assert_eq!(pr_followup_note(&project), None);
+    }
+
+    /// OMP's `bash.patterns` semantics (tools/bash.ts @740f3e3154): whitespace
+    /// runs, newlines included, become one space; `*` matches anything, the rest
+    /// is literal; a `deny`/`prompt` rule fires on the whole command or on any
+    /// segment split at newlines and `;&|()`; the first matching rule wins.
+    fn omp_approval(config: &str, command: &str) -> Option<String> {
+        fn glob(pattern: &str, text: &str) -> bool {
+            let parts: Vec<&str> = pattern.split('*').collect();
+            let (first, last) = (parts[0], parts[parts.len() - 1]);
+            if parts.len() == 1 {
+                return pattern == text;
+            }
+            if !text.starts_with(first) || text.len() < first.len() + last.len() || !text[first.len()..].ends_with(last) {
+                return false;
+            }
+            let mut rest = &text[first.len()..text.len() - last.len()];
+            for part in &parts[1..parts.len() - 1] {
+                match rest.find(part) {
+                    Some(at) => rest = &rest[at + part.len()..],
+                    None => return false,
+                }
+            }
+            true
+        }
+        let normalize = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut candidates = vec![normalize(command)];
+        candidates.extend(command.split(['\n', ';', '&', '|', '(', ')']).map(normalize).filter(|s| !s.is_empty()));
+        let lines: Vec<&str> = config.lines().collect();
+        lines.windows(2).find_map(|pair| {
+            let pattern: String = serde_json::from_str(pair[0].trim().strip_prefix("- match: ")?).ok()?;
+            let approval = pair[1].trim().strip_prefix("approval: ")?;
+            let pattern = normalize(&pattern);
+            candidates.iter().any(|c| glob(&pattern, c)).then(|| approval.to_string())
+        })
+    }
+
+    #[test]
+    fn omp_config_gates_exactly_the_user_only_subcommands() {
+        // The coordinator calls the absolute binary, and the default root has the name in it too.
+        let hp = "/home/u/.local/bin/herdr-projects --root /home/u/.herdr-projects";
+        let config = omp_config(hp, "", Some(&[]));
+        let deny = Some("deny".to_string());
+        let prompt = Some("prompt".to_string());
+        for (command, want) in [
+            (format!("{hp} routine approve demo watch"), deny.clone()),
+            (format!("{hp} configure --clients omp"), deny.clone()),
+            (format!("{hp} configure"), deny.clone()),
+            (format!("{hp} unconfigure"), deny.clone()),
+            (format!("cd /tmp && {hp} unconfigure --clients omp"), deny.clone()),
+            (format!("{hp} safety yolo demo on"), deny.clone()),
+            (format!("{hp} safety yolo --global on"), deny.clone()),
+            (format!("{hp} safety set demo thread_agent_args --dangerously-skip-permissions"), deny.clone()),
+            (format!("{hp} profile add evil --agent claude --arg=--dangerously-skip-permissions"), deny.clone()),
+            (format!("{hp} profile edit claude --arg=--yolo"), deny.clone()),
+            (format!("{hp} profile remove claude"), deny.clone()),
+            (format!("{hp} profile allow threads --all"), deny.clone()),
+            (format!("true; {hp} profile default threads evil"), deny.clone()),
+            (format!("{hp} thread resolve demo t-0001"), prompt.clone()),
+            (format!("{hp} sweep"), prompt.clone()),
+            (format!("{hp} sweep demo --yes"), prompt.clone()),
+            (format!("{hp} archive demo"), prompt.clone()),
+            (format!("{hp}  delete demo --force"), prompt.clone()),
+            (format!("{hp} unarchive demo"), None),
+            (format!("{hp} context demo"), None),
+            (format!("{hp} routine list demo"), None),
+            (format!("{hp} thread show demo t-0001"), None),
+            (format!("{hp} safety show demo"), None),
+            (format!("{hp} safety show --global"), None),
+            (format!("{hp} profile list --project demo"), None),
+            (format!("{hp} profile list"), None),
+            // Slugs that start with a gated word.
+            (format!("{hp} context configure-ci"), None),
+            (format!("{hp} inbox done archive-sync 20260917T000001Z-routine-r-1"), None),
+            (format!("{hp} context profile-work"), None),
+            (format!("{hp} thread start profile-work --title x --task-file t.md"), None),
+            (format!("{hp} thread resolve-later"), None),
+            // Briefs and follow-ups that mention the gated words.
+            (
+                format!("{hp} thread start demo --title \"delete stale flags\" --task-file - <<'TASK'\nconfigure the lint job\narchive old logs, then sweep and delete the rest\nthread resolve nothing\nunconfigure it\nroutine approve nothing\nTASK"),
+                None,
+            ),
+            (format!("{hp} thread prompt demo t-0001 --text-file - <<'EOF'\nPlease configure CI and delete dead code.\nEOF"), None),
+        ] {
+            assert_eq!(omp_approval(&config, &command), want, "{command}");
+        }
+        // Another binary or root is not this coordinator's command.
+        assert_eq!(omp_approval(&config, "/opt/herdr-projects --root /home/u/.herdr-projects configure"), None);
+        for tool in ["eval: prompt", "debug: prompt"] {
+            assert!(config.lines().any(|l| l.trim() == tool), "{tool}");
+        }
     }
 
     #[test]

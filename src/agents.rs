@@ -74,8 +74,8 @@ mod tests {
 
     #[test]
     fn agent_args_carry_only_a_model_flag() {
-        for kind in ["claude", "codex", "gemini", "opencode", "cursor", "copilot"] {
-            for args in [&["--model", "opus"][..], &["--model=gpt-5.5"], &["--model", "anthropic/claude-sonnet-5"], &["--model", "claude-opus-5-5[1m]"], &[]] {
+        for kind in ["claude", "codex", "gemini", "opencode", "cursor", "copilot", "omp"] {
+            for args in [&["--model", "opus"][..], &["--model=gpt-5.5"], &["--model", "anthropic/claude-sonnet-5"], &["--model", "claude-opus-5-5[1m]"], &["--model=anthropic/claude-opus-4-5:high"], &["--model", "openai/gpt-5.5:xhigh"], &[]] {
                 assert_eq!(split_model_args(kind, &strings(args)), (strings(args), vec![]), "{kind} {args:?}");
             }
         }
@@ -93,6 +93,7 @@ mod tests {
         assert_eq!(refused(&["--model", "a b"]), (vec![], strings(&["--model", "a b"])));
         assert_eq!(refused(&["--model", "$(id)"]), (vec![], strings(&["--model", "$(id)"])));
         assert_eq!(refused(&["opus"]), (vec![], strings(&["opus"])));
+        assert_eq!(split_model_args("omp", &strings(&["--thinking", "high"])), (vec![], strings(&["--thinking", "high"])));
     }
 
     #[test]

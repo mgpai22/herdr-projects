@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn hostile_values_survive_a_real_shell_unchanged() {
         for hostile in HOSTILE {
-            let out = RealRunner.run(&Cmd::new("sh", Duration::from_secs(5)).args(["-c".to_string(), format!("printf %s {}", quote(hostile))])).unwrap();
+            let out = RealRunner.run(&Cmd::new(crate::runner::posix_shell(), Duration::from_secs(5)).args(["-c".to_string(), format!("printf %s {}", quote(hostile))])).unwrap();
             assert_eq!(out.stdout, hostile);
         }
     }
@@ -302,11 +302,13 @@ mod tests {
         for hostile in HOSTILE {
             let script = format!("printf %s {}", quote(hostile));
             let remote_command = format!("sh -c {}", quote(&script));
-            let out = RealRunner.run(&Cmd::new("sh", Duration::from_secs(5)).args(["-c", &remote_command])).unwrap();
+            let out = RealRunner.run(&Cmd::new(crate::runner::posix_shell(), Duration::from_secs(5)).args(["-c", &remote_command])).unwrap();
             assert_eq!(out.stdout, hostile, "{remote_command}");
         }
     }
 
+    // Remote machines are POSIX hosts; the local stand-in needs POSIX paths.
+    #[cfg(unix)]
     #[test]
     fn the_brief_script_works_against_a_real_repository_with_a_hostile_path() {
         // The same script, run locally through `sh -c` instead of ssh.

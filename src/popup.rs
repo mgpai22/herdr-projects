@@ -307,7 +307,7 @@ fn thread_line(r: &ThreadRow, with_project: bool) -> String {
         parts.push(format!("on {}", t.machine));
     }
     if !t.agent.is_empty() {
-        parts.push(t.agent.clone());
+        parts.push(if t.omp_profile.is_empty() { t.agent.clone() } else { format!("{} ({})", t.agent, t.omp_profile) });
     }
     if !r.next.is_empty() {
         parts.push(format!("next: {}", r.next.len()));
@@ -547,6 +547,11 @@ fn effort_options(agent: &str) -> Vec<String> {
     std::iter::once(String::new()).chain(crate::profiles::effort_values(agent).unwrap_or_default().iter().map(|v| v.to_string())).collect()
 }
 
+/// The fields the profile form shows: the OMP profile only for harness omp.
+fn form_len(fields: &[Field]) -> usize {
+    if fields[1].value == "omp" { fields.len() } else { fields.len() - 1 }
+}
+
 trait OrDefault {
     fn unwrap_or_default_settings(self) -> (project::Settings, String);
 }
@@ -576,7 +581,8 @@ enum Mode {
     /// Several choices at once: space toggles, ↵ runs `action` with the
     /// checked options appended (`--all` when the first, "every profile", is).
     Toggle { label: String, options: Vec<(String, bool)>, selected: usize, action: Vec<String> },
-    /// The profile form: name, harness, model, effort, arguments, description.
+    /// The profile form: name, harness, model, effort, arguments,
+    /// description, and for harness omp the OMP profile.
     Form { title: String, fields: Vec<Field>, selected: usize, editing: bool },
     /// The project picker (`P`, or `/` straight into its filter).
     Projects(Picker),
@@ -807,7 +813,7 @@ impl<'a> Popup<'a> {
                     Mode::Form { title, fields, selected, editing }
                 }
                 KeyCode::Down | KeyCode::Tab => {
-                    selected = (selected + 1).min(fields.len() - 1);
+                    selected = (selected + 1).min(form_len(&fields) - 1);
                     Mode::Form { title, fields, selected, editing }
                 }
                 KeyCode::Left | KeyCode::Right if !fields[selected].options.is_empty() => {
@@ -836,6 +842,9 @@ impl<'a> Popup<'a> {
                 KeyCode::Enter => {
                     let value = |i: usize| fields[i].value.trim().to_string();
                     let mut args = vec!["profile".to_string(), if editing { "edit" } else { "add" }.into(), value(0), "--agent".into(), value(1), "--model".into(), value(2), "--effort".into(), value(3), "--description".into(), value(5)];
+                    if value(1) == "omp" {
+                        args.extend(["--omp-profile".into(), value(6)]);
+                    }
                     let extra: Vec<String> = fields[4].value.split_whitespace().map(str::to_string).collect();
                     if extra.is_empty() && editing {
                         args.push("--clear-args".into());
@@ -914,8 +923,15 @@ impl<'a> Popup<'a> {
         let existing = name.and_then(|n| config.get(n));
         let editing = existing.as_ref().is_some_and(|p| !p.builtin);
         let entry = existing.as_ref().map(|p| p.entry.clone()).unwrap_or_else(|| crate::profiles::Entry { agent: "claude".into(), ..Default::default() });
-        let mut kinds = crate::profiles::detect(self.ctx.env);
+        // Harnesses only, detected ones first (`detect` also names `omp-<name>` built-ins).
+        let mut kinds: Vec<String> = crate::profiles::detect(self.ctx.env).into_iter().filter(|k| crate::agents::is_kind(k)).collect();
         kinds.extend(crate::agents::KINDS.iter().map(|k| k.to_string()).filter(|k| !kinds.contains(k)).collect::<Vec<_>>());
+        // OMP's default profile, then its named ones, and the profile's own if gone.
+        let mut omp_profiles: Vec<String> = crate::omp::profile_agent_dirs(self.ctx.env).into_iter().map(|(name, _)| name).filter(|n| !n.is_empty()).collect();
+        omp_profiles.insert(0, String::new());
+        if !omp_profiles.contains(&entry.omp_profile) {
+            omp_profiles.push(entry.omp_profile.clone());
+        }
         let fields = vec![
             Field { label: "name", value: name.unwrap_or_default().to_string(), options: Vec::new() },
             Field { label: "harness", value: entry.agent.clone(), options: kinds },
@@ -923,6 +939,7 @@ impl<'a> Popup<'a> {
             Field { label: "effort", value: entry.effort.clone(), options: effort_options(&entry.agent) },
             Field { label: "args", value: entry.args.join(" "), options: Vec::new() },
             Field { label: "description", value: entry.description.clone(), options: Vec::new() },
+            Field { label: "omp profile", value: entry.omp_profile.clone(), options: omp_profiles },
         ];
         let title = match (name, editing) {
             (Some(n), true) => format!("Edit profile `{n}`"),
@@ -1035,8 +1052,8 @@ impl<'a> Popup<'a> {
             KeyCode::Char('r') => {
                 let mut action = Self::thread_args(&row, "restart");
                 action.extend(["--profile".into(), "{}".into()]);
-                let current = if t.profile.is_empty() { &t.agent } else { &t.profile };
-                self.mode = self.profile_picker(&format!("Restart {} with", t.id), &row.slug, Role::Thread, current, action);
+                let current = t.profile_name();
+                self.mode = self.profile_picker(&format!("Restart {} with", t.id), &row.slug, Role::Thread, &current, action);
             }
             KeyCode::Char('x') => {
                 self.mode = Mode::Confirm { question: format!("Resolve {} \"{}\" and clean up its worktree, panes and merged branch? y/N", t.id, t.title), action: Self::thread_args(&row, "resolve"), lines: Vec::new() };
@@ -1328,7 +1345,7 @@ impl<'a> Popup<'a> {
             }
             Mode::Form { title, fields, selected, editing } => {
                 queue!(out, cursor::MoveTo(0, body_top as u16), SetAttribute(Attribute::Bold), Print(fit(&format!(" {title}"), width)), SetAttribute(Attribute::Reset))?;
-                for (i, field) in fields.iter().enumerate() {
+                for (i, field) in fields.iter().enumerate().take(form_len(fields)) {
                     queue!(out, cursor::MoveTo(0, (body_top + 2 + i) as u16))?;
                     let value = if field.options.is_empty() {
                         let cursor = if i == *selected && !(*editing && i == 0) { "▏" } else { "" };
@@ -1347,10 +1364,11 @@ impl<'a> Popup<'a> {
                     "",
                     "  args: extra CLI arguments, separated by spaces (e.g. --config ~/.omp/agent/luna.yml).",
                     "  Effort maps to each harness's own flag; harnesses without one show only (default).",
+                    "  omp profile: the OMP profile herdr launches omp under (~/.omp/profiles/<name>).",
                     "  Profiles live in ~/.config/herdr-projects/config.toml, which agents cannot change.",
                 ];
                 for (i, line) in help.iter().enumerate() {
-                    queue!(out, cursor::MoveTo(0, (body_top + 2 + fields.len() + i) as u16), SetAttribute(Attribute::Dim), Print(fit(line, width)), SetAttribute(Attribute::Reset))?;
+                    queue!(out, cursor::MoveTo(0, (body_top + 2 + form_len(fields) + i) as u16), SetAttribute(Attribute::Dim), Print(fit(line, width)), SetAttribute(Attribute::Reset))?;
                 }
             }
             Mode::Projects(picker) => {
@@ -1467,14 +1485,23 @@ fn fit(text: &str, width: usize) -> String {
     }
 }
 
-/// Copies text to the clipboard with the platform's tool.
+/// Copies text to the clipboard with the platform's tool. Windows' `clip`
+/// takes UTF-16LE input as Unicode; with a byte-order mark it would copy the
+/// mark as a character too, so there is none.
 fn copy(text: &str) -> String {
     use std::process::{Command, Stdio};
+    #[cfg(not(windows))]
     let tools: &[(&str, &[&str])] = if cfg!(target_os = "macos") { &[("pbcopy", &[])] } else { &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"]), ("xsel", &["--clipboard", "--input"])] };
+    #[cfg(not(windows))]
+    let bytes = text.as_bytes();
+    #[cfg(windows)]
+    let tools: &[(&str, &[&str])] = &[("clip", &[])];
+    #[cfg(windows)]
+    let bytes: &[u8] = &text.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
     for (tool, args) in tools {
         if let Ok(mut child) = Command::new(tool).args(*args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
             if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
+                let _ = stdin.write_all(bytes);
             }
             if child.wait().is_ok_and(|s| s.success()) {
                 return format!("copied {text}");
@@ -1512,13 +1539,14 @@ fn focus(ctx: &Ctx, socket: &str, machine: &str, pane: &str) {
     if herdr.agent_focus(pane).is_ok() {
         return;
     }
-    use std::os::unix::process::CommandExt;
     let mut args = Vec::new();
     if !machine.is_empty() {
         args.extend(["--machine".to_string(), machine.to_string()]);
     }
     args.extend(["agent".to_string(), "focus".to_string(), pane.to_string()]);
-    let mut command = std::process::Command::new("/bin/sh");
+    // `/bin/sh` (Git Bash on Windows) sleeps, then becomes the herdr call.
+    let shell = if cfg!(windows) { crate::runner::posix_shell() } else { "/bin/sh".to_string() };
+    let mut command = std::process::Command::new(shell);
     command
         .args(["-c", "sleep 0.2; exec \"$@\"", "sh", &ctx.env.herdr_bin()])
         .args(&args)
@@ -1526,16 +1554,7 @@ fn focus(ctx: &Ctx, socket: &str, machine: &str, pane: &str) {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    unsafe {
-        command.pre_exec(|| {
-            unsafe extern "C" {
-                fn setsid() -> i32;
-            }
-            setsid();
-            Ok(())
-        });
-    }
-    let _ = command.spawn();
+    let _ = crate::runner::spawn_detached(&mut command);
 }
 
 /// The popup's loop, on the terminal Herdr gives the popup (or any terminal,
@@ -1772,6 +1791,48 @@ mod tests {
     }
 
     #[test]
+    fn the_profile_form_asks_for_an_omp_profile_only_for_harness_omp() {
+        let world = crate::scenarios::World::new();
+        std::fs::create_dir_all(world.home.path().join(".omp/profiles/neurable/agent")).unwrap();
+        let ctx = world.ctx();
+        let mut popup = Popup::new(&ctx, None, String::new());
+        let key = |popup: &mut Popup, code| popup.key(KeyEvent::new(code, KeyModifiers::NONE));
+        let selected = |popup: &Popup| match &popup.mode {
+            Mode::Form { selected, .. } => *selected,
+            _ => panic!("not the form"),
+        };
+        popup.section = SECTIONS.iter().position(|s| *s == Section::Settings).unwrap();
+        popup.reload();
+        key(&mut popup, KeyCode::Char('n'));
+        for c in "sol".chars() {
+            key(&mut popup, KeyCode::Char(c));
+        }
+        // Harness claude: the form ends at the description.
+        for _ in 0..8 {
+            key(&mut popup, KeyCode::Down);
+        }
+        assert_eq!(selected(&popup), 5);
+        for _ in 0..4 {
+            key(&mut popup, KeyCode::Up);
+        }
+        while !matches!(&popup.mode, Mode::Form { fields, .. } if fields[1].value == "omp") {
+            key(&mut popup, KeyCode::Right);
+        }
+        for _ in 0..8 {
+            key(&mut popup, KeyCode::Down);
+        }
+        assert_eq!(selected(&popup), 6, "harness omp shows the OMP profile");
+        key(&mut popup, KeyCode::Right);
+        key(&mut popup, KeyCode::Enter);
+        assert!(matches!(popup.mode, Mode::List), "{}", popup.message);
+        let sol = crate::profiles::load(&ctx.config_dir).unwrap().get("sol").unwrap();
+        assert_eq!((sol.agent(), sol.entry.omp_profile.as_str()), ("omp", "neurable"));
+        // The built-in `omp-neurable` is not a harness choice.
+        key(&mut popup, KeyCode::Char('n'));
+        assert!(matches!(&popup.mode, Mode::Form { fields, .. } if fields[1].options.iter().all(|k| crate::agents::is_kind(k))));
+    }
+
+    #[test]
     fn slash_and_shift_p_open_the_picker_and_settings_enter_still_scopes() {
         let world = crate::scenarios::World::new();
         world.project("alpha", "a.sock");
@@ -1868,5 +1929,18 @@ mod tests {
         assert_eq!(slugs, [None, Some("demo")]);
         assert_eq!(rows[0].status, "1 project · 1 need you");
         assert_eq!(rows[1].status, "1 need you");
+    }
+
+    /// `y` puts the exact path on the Windows clipboard, non-ASCII included.
+    #[cfg(windows)]
+    #[test]
+    fn windows_copy_puts_the_exact_path_on_the_clipboard() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("clipboard.txt");
+        let path = r"C:\Users\Zoë\路径\report.md";
+        assert_eq!(copy(path), format!("copied {path}"));
+        let read = format!("[IO.File]::WriteAllText('{}', (Get-Clipboard -Raw))", out.display());
+        assert!(std::process::Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &read]).status().unwrap().success());
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), path);
     }
 }
