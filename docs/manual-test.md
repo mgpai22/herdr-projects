@@ -14,6 +14,11 @@ Checked on 2026-09-24 in a scratch `hp-dev` session under a throwaway `HOME` (he
 | `thread prompt` to an OMP thread blocked on `ask` is queued ("queued for t-0001 (agent was blocked)") and runs after the answer | Builder |
 | An OMP thread's launch prompt carries `workflowz`, and OMP's workflow notice takes effect | Builder (pane text) |
 | A server restart resumes both OMP panes with profile `default` and the same session files; heartbeats resume | Builder (`agent list`) |
+| Profiles: `configure --clients omp` installs the extension and skill into `~/.omp/agent` and `~/.omp/profiles/test/agent`; `doctor` reports each profile and its mstack state (`0.4.0 enabled` / `not installed`) | Builder (herdr 0.9.1-custom.afd9e19893db.a197ece3a731 with `agent start --profile`) |
+| `open --profile test` runs the coordinator through the `test` launcher from `[session.omp_launchers]`; `.omp/config.yml` carries the profile's own `bash.patterns` deny rule | Builder (`agent list` launch_profile / launch_executable) |
+| A default-profile thread with mstack 0.4.0 gets the mstack launch prompt and routes to the `feature` playbook; a `test`-profile thread without mstack gets the workflowz prompt | Builder (pane text) |
+| A default-profile coordinator folder gets `.mstack/config.yml` (`mode: true`) and its session carries the mstack routing reminder | Builder (session file) |
+| A server restart resumes each OMP pane with its own profile launcher | Builder (`agent list`) |
 
 ## 0.2.0: the Herdr-native redesign
 
