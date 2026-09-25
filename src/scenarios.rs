@@ -2173,6 +2173,11 @@ fn restart_sets_keeps_and_clears_the_profile() {
     // Another kind carries no profile.
     restart(Some("claude"), None, None).unwrap();
     assert_eq!(profile_and_args(), ("claude".into(), String::new(), Vec::new()));
+    // A restart refused by its plan (here: resolved) saves nothing it was given.
+    thread::update(&project, "t-0001", |t| t.status = Status::Resolved).unwrap();
+    let error = threads::restart(&ctx, "demo", "t-0001", Some("omp"), Some("work"), Some(strings(&["--model", "opus"]))).unwrap_err().to_string();
+    assert!(error.contains("is resolved"), "{error}");
+    assert_eq!(profile_and_args(), ("claude".into(), String::new(), Vec::new()));
 }
 
 #[test]
@@ -2214,6 +2219,74 @@ fn open_resumes_a_coordinator_only_under_the_same_profile() {
     assert_eq!(project.coordinator().unwrap().omp_profile, "");
     assert!(crate::coordinator::open(&ctx, "demo", &crate::coordinator::OpenOptions { agent: Some("claude".into()), ..options(Some("neurable")) }).is_err());
     assert_eq!(start_calls(&world).len(), 3);
+}
+
+#[test]
+fn open_primes_for_the_profile_it_records_and_a_refused_profile_restores_the_record() {
+    let world = World::new();
+    let project = project::create(&world.root, "demo", "Ship it", vec![]).unwrap();
+    let socket = world.home.path().join("a.sock");
+    std::fs::write(&socket, b"").unwrap();
+    // The project setting is the default profile; neurable denies merges.
+    let neurable = world.home.path().join(".omp/profiles/neurable/agent");
+    std::fs::create_dir_all(&neurable).unwrap();
+    std::fs::write(neurable.join("config.yml"), "bash:\n  patterns:\n    - match: \"*gh *pr merge*\"\n      approval: deny\n").unwrap();
+    world.runner.on("workspace create", ok(r#"{"result":{"root_pane":{"workspace_id":"w3","tab_id":"w3:t1","pane_id":"w3:p1"}}}"#));
+    world.runner.on("tab rename", ok(r#"{"result":{}}"#));
+    world.runner.on("workspace get", ok(r#"{"result":{"workspace":{"label":"Demo"}}}"#));
+    world.runner.on("--profile work", fail(1, r#"{"error":{"code":"unknown_launch_profile","message":"no omp launcher named work in [session.omp_launchers]"}}"#));
+    world.runner.on("--profile old", fail(2, "unknown option: --profile\n"));
+    world.runner.on("agent start", ok(r#"{"result":{"agent":{"pane_id":"w3:p1","tab_id":"w3:t1","workspace_id":"w3","name":"hpc-demo","agent":"omp","agent_status":"idle","agent_session":{"value":"sess-9"},"launch_profile":"neurable"}}}"#));
+    let options = |profile: &str| crate::coordinator::OpenOptions {
+        session: crate::paths::SessionFlags { session: None, socket: Some(socket.clone()) },
+        rebind: false,
+        agent: Some("omp".into()),
+        profile: Some(profile.into()),
+        agent_args: Vec::new(),
+        new: false,
+        here: false,
+    };
+    let ctx = world.ctx();
+    let omp_config = || std::fs::read_to_string(project.dir().join(project::OMP_CONFIG)).unwrap();
+
+    crate::coordinator::open(&ctx, "demo", &options("neurable")).unwrap();
+    assert!(omp_config().contains("\"*gh *pr merge*\""), "{}", omp_config());
+    let before = project.coordinator().unwrap();
+    assert_eq!((before.omp_profile.as_str(), before.agent_session.as_str()), ("neurable", "sess-9"));
+
+    // herdr has no such launcher, or predates --profile: an error, the old record and files kept.
+    for (profile, reason) in [("work", "no omp launcher named work"), ("old", "unknown option: --profile")] {
+        let error = crate::coordinator::open(&ctx, "demo", &options(profile)).unwrap_err().to_string();
+        assert!(error.contains(reason), "{error}");
+        let record = project.coordinator().unwrap();
+        assert_eq!((record.agent.as_str(), record.omp_profile.as_str(), record.agent_session.as_str()), ("omp", "neurable", "sess-9"), "{profile}");
+        assert!(omp_config().contains("\"*gh *pr merge*\""), "{profile}");
+    }
+    assert_eq!(start_calls(&world).len(), 3, "one start per open");
+}
+
+#[test]
+fn a_thread_launch_refused_for_its_profile_fails_at_once_with_herdrs_reason() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let cwd = world.home.path().join("wt");
+    std::fs::create_dir(&cwd).unwrap();
+    let wt = cwd.to_string_lossy().into_owned();
+    world.thread(&project, &cwd, |t| {
+        t.agent = "omp".into();
+        t.omp_profile = "neurable".into();
+        t.prompt_pending = true;
+    });
+    *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(&project), pane_json("w2", "w2:t1", "w2:p1", &wt));
+    world.runner.on("agent start", fail(1, r#"{"error":{"code":"agent_profile_unsupported","message":"the running herdr server predates agent start --profile; restart or hand off the server"}}"#));
+    let ctx = world.ctx();
+
+    ticker::tick_project(&ctx, &project).unwrap();
+    let t = thread::load(&project, "t-0001").unwrap();
+    assert_eq!(t.status, Status::Failed);
+    assert!(t.error.contains("predates agent start --profile"), "{}", t.error);
+    ticker::tick_project(&ctx, &project).unwrap();
+    assert_eq!(world.runner.count("agent start"), 1);
 }
 
 #[test]

@@ -95,9 +95,9 @@ This fork (branch `omp`) adds [OMP](https://github.com/can1357/oh-my-pi) as a co
 
 - `configure` installs an OMP extension and links the `autoproject` skill in every OMP profile: `~/.omp/agent` (or `$PI_CODING_AGENT_DIR`) and each `~/.omp/profiles/<name>/agent`.
 - The extension gives OMP the same progress instructions as the Claude Code and Codex hooks, reports progress from the agent's todo list, and takes the binary's prompts through a file queue instead of typed keystrokes, so a prompt never merges with half-typed text.
-- Each project folder gets `.omp/config.yml`: an OMP coordinator can never run `routine approve`, `configure` or `unconfigure`, and `thread resolve`, `sweep`, `archive`, `delete` and every `eval` or `debug` call wait for you to confirm, also under `approvalMode: yolo`. The global `bash.patterns` of the coordinator's OMP profile follow these rules, so they still apply.
-- Pick a thread's model with `--agent omp --agent-arg --model=<provider/model>:<level>`, and its OMP profile with `--profile <name>` or the project's `omp_profile` setting. A named profile must be in Herdr's `[session.omp_launchers]` and needs a Herdr build with `agent start --profile`.
-- With the [mstack](https://github.com/mgpai22/mstack) plugin enabled in a profile, OMP threads route their task through mstack, the coordinator plans with it, and briefs name each push or pull request they authorize.
+- Each project folder gets `.omp/config.yml`: an OMP coordinator can never run `routine approve`, `configure` or `unconfigure`, and `thread resolve`, `sweep`, `archive`, `delete` and every `eval` or `debug` call wait for you to confirm, also under `approvalMode: yolo`. The global `bash.patterns` of the OMP profile the coordinator runs under are repeated there, with their `deny` rules ahead of the confirmations, so they still apply.
+- Pick a thread's model with `--agent omp --agent-arg --model=<provider/model>:<level>`, and its OMP profile with `--profile <name>` or the project's `omp_profile` setting. A named profile must be in Herdr's `[session.omp_launchers]` and needs a Herdr build with `agent start --profile`, running as the server (restart or hand off the server after you install it).
+- With the [mstack](https://github.com/mgpai22/mstack) plugin enabled in a profile, OMP threads route their task through mstack and the coordinator plans with it. Every brief that may push or open a pull request, for any harness, names what it authorizes in an `Authorized:` line.
 
 [Operations](docs/operations.md#omp) has the details.
 

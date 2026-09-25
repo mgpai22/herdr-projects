@@ -203,11 +203,10 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let session = paths::resolve_session(&options.session, ctx.env, ctx.runner)?;
     let socket = session.socket.to_string_lossy().into_owned();
     let prefix = current_prefix(&ctx.root)?;
-    // The priming files are what make an agent in this folder the coordinator.
-    project::write_priming(&project, &prefix, ctx.env)?;
 
     // A project belongs to the session it was opened in.
-    let mut previous = project.coordinator();
+    let original = project.coordinator();
+    let mut previous = original.clone();
     if let Some(record) = &previous
         && !record.socket.is_empty()
         && record.socket != socket
@@ -268,6 +267,9 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
                 c.agent_session = agent.session_id().to_string();
             }
         })?;
+        // The priming files are what make an agent in this folder the
+        // coordinator; `.omp/config.yml` follows the recorded profile.
+        project::write_priming(&project, &prefix, ctx.env)?;
         report_tokens(&herdr, slug, &label, &record.pane_id);
         ticker::start(ctx)?;
         println!("coordinator is running in pane {} ({} more: pass --new to start another)", record.pane_id, running.len() - 1);
@@ -339,6 +341,8 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             updated: String::new(),
         }
     })?;
+    // Before the agent starts: it reads them, and they follow the profile just recorded.
+    project::write_priming(&project, &prefix, ctx.env)?;
 
     let mut base_args = safety.coordinator_agent_args.clone();
     base_args.extend(options.agent_args.iter().cloned());
@@ -353,6 +357,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     if let Err(error) = &started
         && !resume.is_empty()
         && error.code != "agent_not_ready"
+        && !error.launch_refused()
     {
         // The recorded session may be gone: start fresh once.
         println!("resuming session {} failed ({error}); starting a fresh {kind}", record.agent_session);
@@ -371,6 +376,13 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             } else {
                 println!("started {kind} as {name}, resuming session {}", record.agent_session);
             }
+        }
+        Err(error) if error.launch_refused() => {
+            // Waiting cannot help: put back the coordinator this `open`
+            // replaced (its session stays resumable) and the files for it.
+            project.update_coordinator(|c| *c = original.clone().unwrap_or_default())?;
+            project::write_priming(&project, &prefix, ctx.env)?;
+            bail!("{error}. The previous coordinator record is kept; pane {} is not recorded as the coordinator", record.pane_id);
         }
         Err(error) => println!(
             "{kind} is not ready yet ({error}). If it shows a dialog, answer it in pane {}; it primes itself from AGENTS.md.",

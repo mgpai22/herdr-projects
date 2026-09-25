@@ -130,8 +130,9 @@ impl<'a> Herdr<'a> {
 
 /// A herdr call that failed. `code` is herdr's own error code (for example
 /// `agent_blocked`, or `agent_not_found` from `agent prompt` for a pane that
-/// is gone or runs no agent), or `timeout` / `unreachable` / `failed` when
-/// herdr never answered with one.
+/// is gone or runs no agent), `usage` when herdr's CLI refused the arguments
+/// (exit 2, no JSON: an older herdr that lacks an option), or `timeout` /
+/// `unreachable` / `failed` when herdr never answered with one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HerdrError {
     pub code: String,
@@ -145,6 +146,15 @@ impl std::fmt::Display for HerdrError {
 }
 
 impl std::error::Error for HerdrError {}
+
+impl HerdrError {
+    /// True when herdr refused to launch this agent at all, so trying again
+    /// cannot help: the OMP profile is unknown there or invalid, the kind
+    /// takes no profile, or that herdr (server or CLI) predates `--profile`.
+    pub fn launch_refused(&self) -> bool {
+        matches!(self.code.as_str(), "unknown_launch_profile" | "invalid_launch_profile" | "agent_profile_requires_omp" | "agent_profile_unsupported" | "launch_profile_mismatch" | "usage")
+    }
+}
 
 pub const AGENT_START_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -279,6 +289,9 @@ impl<'a> Herdr<'a> {
         let reply = [&out.stdout, &out.stderr]
             .into_iter()
             .find_map(|text| serde_json::from_str::<serde_json::Value>(text.trim()).ok());
+        // herdr's CLI parser answers a usage error with exit 2 and plain text
+        // (`unknown option: --profile`); a forwarded call may lose the status.
+        let usage = reply.is_none() && (out.code == Some(2) || out.stderr.contains("unknown option"));
         if let Some(reply) = reply {
             if let Some(error) = reply.get("error") {
                 return Err(HerdrError {
@@ -294,7 +307,7 @@ impl<'a> Herdr<'a> {
             return Ok(serde_json::Value::Null);
         }
         Err(HerdrError {
-            code: "failed".into(),
+            code: if usage { "usage" } else { "failed" }.into(),
             message: format!("`herdr {}`: {}", args.join(" "), out.error_text()),
         })
     }

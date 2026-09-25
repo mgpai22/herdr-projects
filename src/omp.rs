@@ -7,6 +7,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
+use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser};
+use yaml_rust2::scanner::{Marker, TScalarStyle};
+use yaml_rust2::{ScanError, Yaml};
 
 use crate::paths::Env;
 
@@ -87,14 +90,14 @@ pub fn profile_agent_dirs(env: &Env) -> Vec<(String, PathBuf)> {
 pub const MSTACK: &str = "@mgpai22/mstack";
 
 /// mstack's version when it is installed and enabled for the profile, as OMP's
-/// plugin manager decides: a lock-file entry's `enabled` wins; a package with
-/// no entry counts when it is a dependency of the plugins `package.json`.
-/// Project-level plugin overrides are not read.
+/// plugin manager decides: a lock-file entry counts only with `enabled: true`;
+/// a package with no entry counts when it is a dependency of the plugins
+/// `package.json`. Project-level plugin overrides are not read.
 pub fn mstack_version(env: &Env, profile: &str) -> Option<(u64, u64, u64)> {
     let plugins = plugins_dir(env, profile);
     let json = |path: &Path| std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
     let enabled = match json(&plugins.join("omp-plugins.lock.json")).as_ref().and_then(|lock| lock["plugins"].get(MSTACK)) {
-        Some(entry) => entry["enabled"].as_bool() != Some(false),
+        Some(entry) => entry["enabled"].as_bool() == Some(true),
         None => json(&plugins.join("package.json")).is_some_and(|p| p["dependencies"].get(MSTACK).is_some()),
     };
     if !enabled {
@@ -111,19 +114,115 @@ pub struct PatternRule {
     pub approval: String,
 }
 
-/// A profile's global `bash.patterns`, from the first of `config.yml` and
-/// `config.yaml` in its agent dir. A missing file has none; an unreadable or
-/// invalid one is an error. Entries OMP would ignore are dropped, and the rest
-/// normalized as OMP does (whitespace runs in the match collapse; the approval
-/// is trimmed and lowercased).
-pub fn bash_patterns(env: &Env, profile: &str) -> Result<Vec<PatternRule>> {
+/// The profile's OMP config file: the first of `config.yml` and `config.yaml`
+/// in its agent dir that exists.
+pub fn config_path(env: &Env, profile: &str) -> Option<PathBuf> {
     let dir = agent_dir(env, profile);
-    let Some(path) = ["config.yml", "config.yaml"].map(|name| dir.join(name)).into_iter().find(|p| p.exists()) else {
+    ["config.yml", "config.yaml"].map(|name| dir.join(name)).into_iter().find(|p| p.exists())
+}
+
+/// Builds the first document like `YamlLoader`, but as Bun.YAML (which OMP
+/// parses with) reads it: a duplicate key keeps its last value, and a `<<`
+/// key merges mappings.
+#[derive(Default)]
+struct Loader {
+    doc: Option<Yaml>,
+    /// Open collections with their anchor ids.
+    stack: Vec<(Yaml, usize)>,
+    /// The pending key of each open mapping.
+    keys: Vec<Option<Yaml>>,
+    anchors: std::collections::HashMap<usize, Yaml>,
+    error: Option<ScanError>,
+}
+
+impl MarkedEventReceiver for Loader {
+    fn on_event(&mut self, event: Event, mark: Marker) {
+        if self.error.is_some() {
+            return;
+        }
+        let (node, anchor) = match event {
+            Event::SequenceStart(anchor, _) => {
+                self.stack.push((Yaml::Array(Vec::new()), anchor));
+                return;
+            }
+            Event::MappingStart(anchor, _) => {
+                self.stack.push((Yaml::Hash(yaml_rust2::yaml::Hash::new()), anchor));
+                self.keys.push(None);
+                return;
+            }
+            Event::SequenceEnd => self.stack.pop().expect("a sequence was started"),
+            Event::MappingEnd => {
+                self.keys.pop();
+                let (node, anchor) = self.stack.pop().expect("a mapping was started");
+                match merge(node) {
+                    Ok(node) => (node, anchor),
+                    Err(info) => {
+                        self.error = Some(ScanError::new(mark, info));
+                        return;
+                    }
+                }
+            }
+            Event::Scalar(value, TScalarStyle::Plain, anchor, None) => (Yaml::from_str(&value), anchor),
+            Event::Scalar(value, _, anchor, _) => (Yaml::String(value), anchor),
+            Event::Alias(id) => (self.anchors.get(&id).cloned().unwrap_or(Yaml::BadValue), 0),
+            _ => return,
+        };
+        if anchor > 0 {
+            self.anchors.insert(anchor, node.clone());
+        }
+        match self.stack.last_mut() {
+            None => self.doc = Some(node),
+            Some((Yaml::Array(items), _)) => items.push(node),
+            Some((Yaml::Hash(map), _)) => {
+                let key = self.keys.last_mut().expect("an open mapping has a key slot");
+                match key.take() {
+                    None => *key = Some(node),
+                    Some(key) => {
+                        map.insert(key, node);
+                    }
+                }
+            }
+            Some(_) => unreachable!("only collections are pushed"),
+        }
+    }
+}
+
+const MERGE_ERROR: &str = "unsupported merge key `<<`: it merges only a mapping or a list of mappings";
+
+/// Resolves a mapping's `<<` key: its own keys win, then earlier sources.
+fn merge(node: Yaml) -> Result<Yaml, &'static str> {
+    let Yaml::Hash(mut map) = node else {
+        return Ok(node);
+    };
+    let sources = match map.remove(&Yaml::String("<<".into())) {
+        None => Vec::new(),
+        Some(Yaml::Hash(source)) => vec![source],
+        Some(Yaml::Array(items)) => items.into_iter().map(|item| if let Yaml::Hash(source) = item { Ok(source) } else { Err(MERGE_ERROR) }).collect::<Result<_, _>>()?,
+        Some(_) => return Err(MERGE_ERROR),
+    };
+    for (key, value) in sources.into_iter().flatten() {
+        if !map.contains_key(&key) {
+            map.insert(key, value);
+        }
+    }
+    Ok(Yaml::Hash(map))
+}
+
+/// A profile's global `bash.patterns`, from its `config_path`. A missing file
+/// has none; an unreadable or invalid one is an error. Entries OMP would
+/// ignore are dropped, and the rest normalized as OMP does (whitespace runs in
+/// the match collapse; the approval is trimmed and lowercased).
+pub fn bash_patterns(env: &Env, profile: &str) -> Result<Vec<PatternRule>> {
+    let Some(path) = config_path(env, profile) else {
         return Ok(Vec::new());
     };
     let text = std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("{} cannot be read: {e}", path.display()))?;
-    let docs = yaml_rust2::YamlLoader::load_from_str(&text).map_err(|e| anyhow::anyhow!("{} is not valid YAML: {e}", path.display()))?;
-    let Some(patterns) = docs.first().and_then(|doc| doc["bash"]["patterns"].as_vec()) else {
+    let mut loader = Loader::default();
+    let parsed = Parser::new_from_str(&text).load(&mut loader, false);
+    if let Some(e) = parsed.err().or(loader.error) {
+        bail!("{} is not valid YAML: {e}", path.display());
+    }
+    let Some(patterns) = loader.doc.as_ref().and_then(|doc| doc["bash"]["patterns"].as_vec()) else {
         return Ok(Vec::new());
     };
     Ok(patterns
@@ -212,6 +311,8 @@ mod tests {
         assert_eq!(mstack_version(&env, ""), None, "plugins are per profile");
         lock("false");
         assert_eq!(mstack_version(&env, "neurable"), None, "disabled");
+        std::fs::write(plugins.join("omp-plugins.lock.json"), format!(r#"{{"plugins":{{"{MSTACK}":{{"version":"0.4.0"}}}}}}"#)).unwrap();
+        assert_eq!(mstack_version(&env, "neurable"), None, "an entry without `enabled` is off, as in OMP");
         std::fs::remove_file(plugins.join("omp-plugins.lock.json")).unwrap();
         std::fs::write(plugins.join("package.json"), format!(r#"{{"dependencies":{{"{MSTACK}":"^0.4"}}}}"#)).unwrap();
         assert_eq!(mstack_version(&env, "neurable"), Some((0, 4, 1)), "a dependency with no lock entry is enabled");
@@ -238,5 +339,31 @@ mod tests {
         assert!(bash_patterns(&env, "neurable").is_err());
         std::fs::write(dir.join("config.yml"), b"\xff\xfe").unwrap();
         assert!(bash_patterns(&env, "neurable").is_err());
+    }
+
+    #[test]
+    fn bash_patterns_read_duplicate_and_merge_keys_as_bun_does() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let dir = agent_dir(&env, "");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rule = |m: &str, a: &str| PatternRule { matcher: m.into(), approval: a.into() };
+        let read = |yaml: &str| {
+            std::fs::write(dir.join("config.yml"), yaml).unwrap();
+            bash_patterns(&env, "")
+        };
+        // A duplicate key keeps its last value, wherever it is.
+        let deny_merge = "    - match: \"*gh *pr merge*\"\n      approval: deny\n";
+        assert_eq!(read(&format!("theme: dark\ntheme: light\nbash:\n  patterns: []\nbash:\n  patterns:\n{deny_merge}")).unwrap(), vec![rule("*gh *pr merge*", "deny")]);
+        // `<<` merges an anchored mapping; the mapping's own keys win.
+        let base = format!("base: &b\n  patterns:\n{deny_merge}  other: 1\n");
+        assert_eq!(read(&format!("{base}bash:\n  <<: *b\n")).unwrap(), vec![rule("*gh *pr merge*", "deny")]);
+        assert!(read(&format!("{base}bash:\n  <<: *b\n  patterns: []\n")).unwrap().is_empty());
+        assert_eq!(read(&format!("{base}empty: &e\n  patterns: []\nbash:\n  <<: [*b, *e]\n")).unwrap(), vec![rule("*gh *pr merge*", "deny")], "an earlier source wins");
+        // So does a list entry built from an anchor.
+        assert_eq!(read("r: &r\n  match: ls *\nbash:\n  patterns:\n    - <<: *r\n      approval: allow\n").unwrap(), vec![rule("ls *", "allow")]);
+        // A merge OMP could not resolve either is an error doctor names.
+        let error = read("bash:\n  <<: [1]\n").unwrap_err().to_string();
+        assert!(error.contains("merge key `<<`"), "{error}");
     }
 }

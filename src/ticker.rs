@@ -632,8 +632,15 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
             }
             let mut args = safety.thread_agent_args.clone();
             args.extend(model);
-            herdr.on_machine(&t.machine).agent_start(&t.agent_name, &t.agent, &t.omp_profile, &t.pane_id, &args)?;
-            Ok(())
+            match herdr.on_machine(&t.machine).agent_start(&t.agent_name, &t.agent, &t.omp_profile, &t.pane_id, &args) {
+                // Another attempt gets the same answer: fail now, with herdr's reason.
+                Err(error) if error.launch_refused() => thread::update(project, &t.id, |t| {
+                    t.status = thread::Status::Failed;
+                    t.error = error.to_string();
+                })
+                .map(|_| ()),
+                other => other.map(|_| ()).map_err(Into::into),
+            }
         })();
         errors.extend(launched.err().map(|e| e.context(format!("{}: launch", t.id))));
     }

@@ -444,18 +444,20 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, agent: Option<&str>, profile: Op
     let (settings, _) = project.read_project_md()?;
     let fallback = if current.agent == "omp" { &current.omp_profile } else { &settings.omp_profile };
     let profile = crate::settings::launch_profile(&kind, profile, fallback, &settings.omp_profile)?;
-    thread::update(&project, id, |t| {
+    let change = |t: &mut Thread| {
         // Another harness: the old arguments (a model flag) no longer apply.
         if t.agent != kind {
             t.agent_args.clear();
         }
         t.agent = kind.clone();
         t.omp_profile = profile.clone();
-        if let Some(args) = agent_args {
-            t.agent_args = args;
+        if let Some(args) = &agent_args {
+            t.agent_args = args.clone();
         }
-    })?;
-    let record = thread::load(&project, id)?;
+    };
+    // The refusals below run on a copy: a refused restart changes nothing.
+    let mut record = current;
+    change(&mut record);
     ticker::start(ctx)?;
     let view = require_session(ctx, &project)?;
     let (agents, panes) = lists_for(&view, &record)?;
@@ -471,7 +473,9 @@ pub fn restart(ctx: &Ctx, slug: &str, id: &str, agent: Option<&str>, profile: Op
         }
     };
 
-    match restart_plan(&record, &live, branch_exists, now)? {
+    let plan = restart_plan(&record, &live, branch_exists, now)?;
+    thread::update(&project, id, change)?;
+    match plan {
         RestartPlan::Create => return place_and_brief(ctx, &project, &view, id, true),
         RestartPlan::ReusePane => {}
         RestartPlan::Reopen => match record.kind {

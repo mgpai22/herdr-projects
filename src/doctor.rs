@@ -182,6 +182,12 @@ fn report(
                     }
                 }
             }
+            // The profile's config is the user's own OMP config: named with
+            // its own hint, never "remove it".
+            let (profile, left): (Vec<String>, Vec<String>) = left.into_iter().partition(|p| p.starts_with(project::PROFILE_PROBLEM));
+            for problem in profile {
+                check(&mut out, None, &label, problem);
+            }
             let (kept, repairable): (Vec<String>, Vec<String>) = left.into_iter().partition(|p| p.contains("cannot be read"));
             if !kept.is_empty() {
                 check(&mut out, None, &label, format!("{}; left alone; fix its permissions or remove it", kept.join("; ")));
@@ -571,6 +577,24 @@ mod tests {
         let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, None);
         std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(text.contains("[warn] files demo: .omp/config.yml is missing\n") && !text.contains("fixed:"), "{text}");
+    }
+
+    #[test]
+    fn a_broken_profile_config_is_named_with_its_own_hint_not_the_left_alone_one() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        let root = home.path().join("root");
+        let flags = SessionFlags::default();
+        project::create(&root, "demo", "", vec![]).unwrap();
+        // Unreadable as text: OMP's own config, which the "cannot be read" bucket would tell the user to remove.
+        let config = home.path().join(".omp/agent/config.yml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, b"\xff\xfe").unwrap();
+        let (text, _) = report(&env, &root, &home.path().join("cfg"), &flags, &runner, true, None);
+        let line = text.lines().find(|l| l.starts_with(&format!("[warn] files demo: {}", project::PROFILE_PROBLEM))).unwrap_or_else(|| panic!("{text}"));
+        assert!(line.ends_with(&format!("; fix {}, or run `set demo omp_profile <name>` to use another profile", config.display())), "{line}");
+        assert!(!text.contains("fix its permissions or remove it"), "{text}");
     }
 
     #[test]
