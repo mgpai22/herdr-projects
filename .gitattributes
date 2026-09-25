@@ -1,0 +1,4 @@
+# Embedded with include_str! and written to disk as is: the same bytes on
+# every platform, also in a Windows checkout with core.autocrlf.
+assets/omp/*.ts text eol=lf
+skill/**/*.md text eol=lf

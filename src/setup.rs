@@ -105,8 +105,17 @@ pub fn herdr_config_path(env: &Env) -> PathBuf {
 
 /// The tab-bar command: absolute paths, since it runs under `/bin/sh -lc` on
 /// the server with no plugin environment.
+#[cfg(unix)]
 pub fn tab_command(binary: &Path, root: &Path) -> String {
     format!("{} --root {} needs-you --line", quote(&binary.to_string_lossy()), quote(&root.to_string_lossy()))
+}
+
+/// The tab-bar command. Herdr on Windows runs it as `cmd.exe /d /c <line>`:
+/// both paths in double quotes, and the whole line quoted once more, because
+/// cmd strips the first and last quote of a line holding more than two.
+#[cfg(windows)]
+pub fn tab_command(binary: &Path, root: &Path) -> String {
+    format!("\"\"{}\" --root \"{}\" needs-you --line\"", binary.display(), root.display())
 }
 
 fn hook_entry(command: &str) -> serde_json::Value {
@@ -175,7 +184,7 @@ pub fn hooks(input: &str, command: &str, remove: bool) -> Result<String> {
 /// failing UserPromptSubmit hook (exit 2) as "block this prompt", in every
 /// session on the machine, so a missing or older binary must not do that.
 pub fn hook_command(binary: &Path, root: &Path, agent: &str) -> String {
-    format!("{} --root {} hook --agent {agent} 2>/dev/null || true", quote(&binary.to_string_lossy()), quote(&root.to_string_lossy()))
+    format!("{} --root {} hook --agent {agent} 2>/dev/null || true", quote(&crate::paths::shell_path(binary)), quote(&crate::paths::shell_path(root)))
 }
 
 /// Where each harness keeps its hooks.
@@ -265,8 +274,8 @@ pub fn omp_extension_root(text: &str) -> Option<String> {
 /// Whether OMP already loads the bundled skill through `~/.agents/skills`
 /// (the Codex link), which every OMP profile reads: a second link would list it twice.
 pub fn omp_sees_shared_skill(env: &Env, source: &Path) -> bool {
-    let shared = std::fs::canonicalize(env.home.join(".agents/skills").join(SKILL));
-    shared.is_ok_and(|shared| std::fs::canonicalize(source).is_ok_and(|source| source == shared))
+    let shared = crate::paths::canonicalize(env.home.join(".agents/skills").join(SKILL));
+    shared.is_ok_and(|shared| crate::paths::canonicalize(source).is_ok_and(|source| source == shared))
 }
 
 /// The skill bundled with the plugin, linked into each harness by `configure`.
@@ -302,7 +311,7 @@ pub fn omp_skill_link(agent_dir: &Path) -> PathBuf {
 /// resolved, so a shared directory gets one link and one journal key; a
 /// missing one is resolved through its parent, so the key stays the same once it exists.
 fn link_in(dir: PathBuf) -> PathBuf {
-    let resolved = std::fs::canonicalize(&dir).or_else(|_| std::fs::canonicalize(dir.parent().unwrap_or(&dir)).map(|p| p.join("skills")));
+    let resolved = crate::paths::canonicalize(&dir).or_else(|_| crate::paths::canonicalize(dir.parent().unwrap_or(&dir)).map(|p| p.join("skills")));
     resolved.unwrap_or(dir).join(SKILL)
 }
 
@@ -511,12 +520,68 @@ pub fn configure(ctx: &Ctx, options: &ConfigureOptions) -> Result<Vec<String>> {
     for (link, source) in &links {
         let Some(source) = source else { continue };
         if std::fs::symlink_metadata(link).is_ok() {
-            std::fs::remove_file(link)?;
+            remove_link(link)?;
         }
         std::fs::create_dir_all(link.parent().context("skill link has no parent")?)?;
-        std::os::unix::fs::symlink(source, link).with_context(|| format!("could not link {}", link.display()))?;
+        if link_dir(source, link).with_context(|| format!("could not link {}", link.display()))? == DirLink::Junction {
+            notes.push(format!("{}: no symbolic link privilege; linked as a directory junction", link.display()));
+        }
     }
     Ok(notes)
+}
+
+#[derive(Debug, PartialEq)]
+pub enum DirLink {
+    Symlink,
+    /// Windows without the symbolic-link privilege (Developer Mode off).
+    #[cfg_attr(unix, allow(dead_code))]
+    Junction,
+}
+
+/// `link -> source`, a directory link. `skill_state` reads both kinds: Rust
+/// reports a junction as a symbolic link and `read_link` returns its target.
+pub fn link_dir(source: &Path, link: &Path) -> std::io::Result<DirLink> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(source, link).map(|_| DirLink::Symlink)
+    }
+    #[cfg(windows)]
+    {
+        const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+        match std::os::windows::fs::symlink_dir(source, link) {
+            Ok(()) => Ok(DirLink::Symlink),
+            Err(e) if e.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => {
+                let out = std::process::Command::new("cmd").args(["/d", "/c", "mklink", "/J"]).arg(link).arg(source).stdin(std::process::Stdio::null()).output()?;
+                if !out.status.success() {
+                    return Err(std::io::Error::other(format!("mklink /J failed: {}", String::from_utf8_lossy(&out.stdout).trim())));
+                }
+                Ok(DirLink::Junction)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Removes a link, never what it points at. Windows removes a directory
+/// link (symbolic or junction) as a directory.
+pub fn remove_link(link: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if std::fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink_dir()) {
+            return std::fs::remove_dir(link);
+        }
+    }
+    std::fs::remove_file(link)
+}
+
+/// A file symbolic link, for tests on either platform (the target may be missing).
+#[cfg(test)]
+pub fn file_link(target: impl AsRef<Path>, link: impl AsRef<Path>) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(target, link).unwrap();
 }
 
 /// Removes exactly what `configure` added: the file goes back to its journaled
@@ -530,7 +595,7 @@ pub fn unconfigure(ctx: &Ctx) -> Result<Vec<String>> {
         if owned.kind == "skill" {
             match skill_state(path, Path::new(&owned.after)) {
                 SkillState::Ours => {
-                    std::fs::remove_file(path)?;
+                    remove_link(path)?;
                     notes.push(format!("{key}: skill link removed"));
                 }
                 SkillState::Missing => notes.push(format!("{key}: already gone")),
@@ -623,9 +688,51 @@ mod tests {
     #[test]
     fn the_hook_command_never_fails_even_with_a_missing_binary() {
         let command = hook_command(Path::new("/no/such/herdr-projects"), Path::new("/r"), "claude");
-        let out = std::process::Command::new("/bin/sh").args(["-c", &command]).output().unwrap();
+        let shell = if cfg!(windows) { crate::runner::posix_shell() } else { "/bin/sh".to_string() };
+        let out = std::process::Command::new(shell).args(["-c", &command]).output().unwrap();
         assert!(out.status.success());
         assert!(out.stdout.is_empty() && out.stderr.is_empty());
+    }
+
+    /// Herdr on Windows runs the tab-bar line with `cmd.exe /d /c`; paths with
+    /// spaces must reach the program as single arguments.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_tab_command_survives_cmd() {
+        use std::os::windows::process::CommandExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("bin dir");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let binary = bin_dir.join("hp.cmd");
+        std::fs::write(&binary, "@echo [%1] [%2] [%3] [%4]\r\n").unwrap();
+        let root = dir.path().join("my root");
+        let out = std::process::Command::new("cmd").args(["/d", "/c"]).raw_arg(tab_command(&binary, &root)).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), format!("[--root] [\"{}\"] [needs-you] [--line]", root.display()));
+    }
+
+    /// Both kinds of Windows directory link read as ours and are removed
+    /// without touching the skill they point at.
+    #[cfg(windows)]
+    #[test]
+    fn windows_symlinks_and_junctions_are_skill_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("skill");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("SKILL.md"), "x").unwrap();
+        let link = dir.path().join("skills").join(SKILL);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        assert_eq!(link_dir(&source, &link).unwrap(), DirLink::Symlink);
+        assert_eq!(skill_state(&link, &source), SkillState::Ours);
+        remove_link(&link).unwrap();
+        assert_eq!(skill_state(&link, &source), SkillState::Missing);
+        let out = std::process::Command::new("cmd").args(["/d", "/c", "mklink", "/J"]).arg(&link).arg(&source).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+        assert_eq!(skill_state(&link, &source), SkillState::Ours);
+        assert!(link.join("SKILL.md").is_file());
+        remove_link(&link).unwrap();
+        assert_eq!(skill_state(&link, &source), SkillState::Missing);
+        assert!(source.join("SKILL.md").is_file());
     }
 
     #[test]
@@ -721,14 +828,14 @@ mod tests {
         std::fs::create_dir_all(home.path().join("codex")).unwrap();
         std::fs::create_dir_all(&claude).unwrap();
         // Like this Mac: Claude's skills dir is itself a link to ~/.agents/skills.
-        std::os::unix::fs::symlink(&shared, claude.join("skills")).unwrap();
+        link_dir(&shared, &claude.join("skills")).unwrap();
         let source = home.path().join("plugin/skill/autoproject");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join("SKILL.md"), "---\nname: autoproject\n---\n").unwrap();
         let runner = crate::runner::fake::FakeRunner::new();
         let ctx = Ctx { env: &env, root: home.path().join("root"), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: false };
         let options = |dry_run: bool, skill: &Path| ConfigureOptions { clients: vec![], claude_home: Some(claude.clone()), codex_home: Some(home.path().join("codex")), dry_run, hooks: true, sidebar: false, key: None, herdr_config: None, skill: Some(skill.to_path_buf()) };
-        let link = std::fs::canonicalize(&shared).unwrap().join(SKILL);
+        let link = crate::paths::canonicalize(&shared).unwrap().join(SKILL);
 
         // A plain directory already there (the old personal copy) is never touched.
         std::fs::create_dir_all(shared.join(SKILL)).unwrap();
@@ -760,21 +867,23 @@ mod tests {
         assert_eq!(skill_state(&link, &moved), SkillState::Missing);
         assert!(shared.is_dir());
         configure(&ctx, &options(false, &moved)).unwrap();
-        std::fs::remove_file(&link).unwrap();
-        std::os::unix::fs::symlink(home.path(), &link).unwrap();
+        remove_link(&link).unwrap();
+        link_dir(home.path(), &link).unwrap();
         let notes = unconfigure(&ctx).unwrap();
         assert!(notes.iter().any(|n| n.contains("left alone")), "{notes:?}");
         assert!(link.is_symlink());
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlinked_config_is_refused_without_touching_the_target() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("real.json");
         let link = dir.path().join("settings.json");
         std::fs::write(&target, "{\"user\":true}").unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&target, &link).unwrap();
         assert!(read(&link).is_err());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"user\":true}");
     }

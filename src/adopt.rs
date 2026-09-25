@@ -242,7 +242,8 @@ mod tests {
     #[test]
     fn adopting_records_the_panes_omp_profile() {
         let (world, _, cwd) = world_with_agent("working", "my-agent");
-        let omp = |pane: &str, profile: &str| format!(r#"{{"pane_id":"{pane}","tab_id":"w5:t1","workspace_id":"w5","cwd":"{cwd}","agent":"omp","agent_status":"working","launch_profile":"{profile}"}}"#);
+        let json_cwd = crate::scenarios::json_path(&cwd);
+        let omp = |pane: &str, profile: &str| format!(r#"{{"pane_id":"{pane}","tab_id":"w5:t1","workspace_id":"w5","cwd":"{json_cwd}","agent":"omp","agent_status":"working","launch_profile":"{profile}"}}"#);
         *world.agents.borrow_mut() = format!("[{},{}]", omp("w5:p1", "neurable"), omp("w5:p2", "default"));
         assert_eq!(adopt(&world.ctx(), "demo", "w5:p1", "Named", None).unwrap().omp_profile, "neurable");
         // herdr's "default" is stored as the empty default, like every record.

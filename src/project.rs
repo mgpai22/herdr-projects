@@ -285,7 +285,7 @@ impl Project {
     /// The canonical folder (symlinks resolved): the key of the project's
     /// `[safety]` table and of its routine approvals.
     pub fn canonical_dir(&self) -> PathBuf {
-        std::fs::canonicalize(self.dir()).unwrap_or_else(|_| self.dir())
+        crate::paths::canonicalize(self.dir()).unwrap_or_else(|_| self.dir())
     }
 
     /// Takes the per-project lock. The lock file is opened without creating
@@ -536,7 +536,9 @@ pub fn write_priming(project: &Project, prefix: &str, env: &Env) -> Result<()> {
     let claude = dir.join("CLAUDE.md");
     let link_ok = std::fs::read_link(&claude).is_ok_and(|target| target == Path::new("AGENTS.md"));
     if !link_ok {
-        if std::fs::symlink_metadata(&claude).is_ok() {
+        if claude_is_our_copy(&claude) {
+            std::fs::remove_file(&claude)?;
+        } else if std::fs::symlink_metadata(&claude).is_ok() {
             // A regular file or a link elsewhere: keep its text beside it, once.
             let kept = dir.join("CLAUDE.md.before-herdr-projects");
             if !kept.exists() {
@@ -545,7 +547,7 @@ pub fn write_priming(project: &Project, prefix: &str, env: &Env) -> Result<()> {
                 std::fs::remove_file(&claude)?;
             }
         }
-        std::os::unix::fs::symlink("AGENTS.md", &claude).with_context(|| format!("could not link {}", claude.display()))?;
+        link_claude_md(&dir).with_context(|| format!("could not link {}", claude.display()))?;
     }
     if !dir.join("uploads").is_dir() {
         std::fs::create_dir(dir.join("uploads"))?;
@@ -562,6 +564,38 @@ pub fn write_priming(project: &Project, prefix: &str, env: &Env) -> Result<()> {
         let _ = std::fs::remove_file(&mstack);
     }
     Ok(())
+}
+
+/// `CLAUDE.md -> AGENTS.md`. Windows without the symbolic-link privilege
+/// (Developer Mode off) gets a copy instead, refreshed on every write.
+fn link_claude_md(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("AGENTS.md", dir.join("CLAUDE.md"))
+    }
+    #[cfg(windows)]
+    {
+        const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+        match std::os::windows::fs::symlink_file("AGENTS.md", dir.join("CLAUDE.md")) {
+            Err(e) if e.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => {
+                eprintln!("herdr-projects: no symbolic link privilege; {} is a copy of AGENTS.md", dir.join("CLAUDE.md").display());
+                std::fs::copy(dir.join("AGENTS.md"), dir.join("CLAUDE.md")).map(drop)
+            }
+            other => other,
+        }
+    }
+}
+
+/// A regular `CLAUDE.md` written as a copy by `link_claude_md` (Windows only).
+fn claude_is_our_copy(claude: &Path) -> bool {
+    cfg!(windows) && std::fs::symlink_metadata(claude).is_ok_and(|m| m.is_file()) && std::fs::read_to_string(claude).is_ok_and(|t| t.contains("Written by herdr-projects"))
+}
+
+/// `CLAUDE.md` links to `AGENTS.md`, or is our up-to-date copy of it.
+fn claude_md_ok(dir: &Path) -> bool {
+    let claude = dir.join("CLAUDE.md");
+    std::fs::read_link(&claude).is_ok_and(|t| t == Path::new("AGENTS.md"))
+        || (claude_is_our_copy(&claude) && std::fs::read(&claude).ok() == std::fs::read(dir.join("AGENTS.md")).ok())
 }
 
 pub const OMP_CONFIG: &str = ".omp/config.yml";
@@ -732,7 +766,7 @@ pub fn priming_problems(project: &Project, prefix: &str, env: &Env) -> Vec<Strin
             }
         },
     }
-    if !std::fs::read_link(dir.join("CLAUDE.md")).is_ok_and(|t| t == Path::new("AGENTS.md")) {
+    if !claude_md_ok(&dir) {
         problems.push("CLAUDE.md is not a link to AGENTS.md".into());
     }
     if !dir.join("uploads").is_dir() {
@@ -776,7 +810,7 @@ pub fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> Result<P
             // A remote path is stored as it is on its own machine.
             Some(_) => repo,
             None => Repo {
-                path: std::fs::canonicalize(&repo.path)
+                path: crate::paths::canonicalize(&repo.path)
                     .or_else(|_| std::path::absolute(&repo.path))
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or(repo.path),
@@ -908,7 +942,7 @@ mod tests {
             settings.repos,
             vec![
                 Repo { path: "/srv/app".into(), machine: Some("box".into()) },
-                Repo { path: "/no/such/repo".into(), machine: None },
+                Repo { path: std::path::absolute("/no/such/repo").unwrap().to_string_lossy().into_owned(), machine: None },
             ]
         );
         assert!(body.starts_with("# Instructions"));
@@ -955,6 +989,22 @@ mod tests {
         write_priming(&project, &prefix, &env).unwrap();
         assert_eq!(std::fs::read_to_string(project.dir().join("CLAUDE.md.before-herdr-projects")).unwrap(), "mine");
         assert!(priming_problems(&project, &prefix, &env).is_empty());
+
+        // Windows without the symlink privilege: our copy counts while it is
+        // current; a stale one is reported and replaced, never kept aside.
+        #[cfg(windows)]
+        {
+            let claude = project.dir().join("CLAUDE.md");
+            std::fs::remove_file(&claude).unwrap();
+            std::fs::copy(project.dir().join("AGENTS.md"), &claude).unwrap();
+            assert!(priming_problems(&project, &prefix, &env).is_empty());
+            let stale = format!("{}\nolder text\n", std::fs::read_to_string(&claude).unwrap());
+            std::fs::write(&claude, stale).unwrap();
+            assert!(priming_problems(&project, &prefix, &env).iter().any(|p| p.contains("CLAUDE.md")));
+            write_priming(&project, &prefix, &env).unwrap();
+            assert_eq!(std::fs::read_link(&claude).unwrap(), Path::new("AGENTS.md"));
+            assert_eq!(std::fs::read_to_string(project.dir().join("CLAUDE.md.before-herdr-projects")).unwrap(), "mine");
+        }
     }
 
     #[test]
@@ -999,15 +1049,18 @@ mod tests {
         assert!(path.is_dir());
 
         // A failed write does not fail the other priming files (`open` for any harness).
-        use std::os::unix::fs::PermissionsExt;
-        let omp = project.dir().join(".omp");
-        std::fs::remove_dir(&path).unwrap();
-        std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o500)).unwrap();
-        std::fs::remove_file(project.dir().join("AGENTS.md")).unwrap();
-        let result = write_priming(&project, &prefix, &env);
-        std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o700)).unwrap();
-        result.unwrap();
-        assert!(project.dir().join("AGENTS.md").is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let omp = project.dir().join(".omp");
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o500)).unwrap();
+            std::fs::remove_file(project.dir().join("AGENTS.md")).unwrap();
+            let result = write_priming(&project, &prefix, &env);
+            std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o700)).unwrap();
+            result.unwrap();
+            assert!(project.dir().join("AGENTS.md").is_file());
+        }
     }
 
     #[test]
@@ -1058,7 +1111,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), omp_config(&prefix, "", None));
         let problems = priming_problems(&project, &prefix, &env);
         assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].starts_with(PROFILE_PROBLEM) && problems[0].contains(&format!("fix {}", agent.join("config.yml").display())), "{problems:?}");
+        assert!(problems[0].starts_with(PROFILE_PROBLEM) && problems[0].contains(&format!("fix {}", crate::omp::agent_dir(&env, "neurable").join("config.yml").display())), "{problems:?}");
 
         // So does a profile name OMP would refuse.
         std::fs::write(agent.join("config.yml"), "bash:\n  patterns: []\n").unwrap();

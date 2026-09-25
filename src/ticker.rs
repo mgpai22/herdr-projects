@@ -63,12 +63,40 @@ pub fn lock_state(root: &Path) -> LockState {
     };
     match file.try_lock() {
         Ok(()) => LockState::Free,
-        Err(_) => {
-            let mut text = String::new();
-            let _ = file.read_to_string(&mut text);
-            LockState::Held(serde_json::from_str(&text).unwrap_or_default())
-        }
+        Err(_) => LockState::Held(serde_json::from_str(&held_info(root, &mut file)).unwrap_or_default()),
     }
+}
+
+#[cfg(unix)]
+fn held_info(_root: &Path, file: &mut File) -> String {
+    let mut text = String::new();
+    let _ = file.read_to_string(&mut text);
+    text
+}
+
+/// Windows file locks are mandatory: no other process can read the locked
+/// file, so the holder also writes its info beside it.
+#[cfg(windows)]
+fn info_path(root: &Path) -> PathBuf {
+    root.join(".ticker.info")
+}
+
+#[cfg(windows)]
+fn held_info(root: &Path, _file: &mut File) -> String {
+    std::fs::read_to_string(info_path(root)).unwrap_or_default()
+}
+
+/// The lock holder records who it is, for `lock_state`.
+fn write_info(root: &Path, lock: &mut File, info: &Info) -> Result<()> {
+    let json = serde_json::to_string_pretty(info)?;
+    lock.set_len(0)?;
+    lock.write_all(json.as_bytes())?;
+    lock.flush()?;
+    #[cfg(windows)]
+    std::fs::write(info_path(root), &json)?;
+    #[cfg(unix)]
+    let _ = root;
+    Ok(())
 }
 
 #[derive(Debug, PartialEq)]
@@ -112,14 +140,9 @@ pub fn start(ctx: &Ctx) -> Result<()> {
     }
 }
 
-unsafe extern "C" {
-    fn setsid() -> i32;
-}
-
 /// `ticker run`, detached: null stdio and a new session, so it does not die
 /// with the process group of whatever started it (an agent's shell tool).
 fn spawn(root: &Path) -> Result<()> {
-    use std::os::unix::process::CommandExt;
     let binary = crate::paths::binary()?;
     let mut command = Command::new(binary);
     command
@@ -134,14 +157,7 @@ fn spawn(root: &Path) -> Result<()> {
     for key in ["HERDR_SOCKET_PATH", "HERDR_SESSION", "HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID"] {
         command.env_remove(key);
     }
-    // SAFETY: setsid is async-signal-safe and touches no memory.
-    unsafe {
-        command.pre_exec(|| {
-            setsid();
-            Ok(())
-        });
-    }
-    command.spawn().context("could not start the ticker")?;
+    crate::runner::spawn_detached(&mut command).context("could not start the ticker")?;
     Ok(())
 }
 
@@ -186,11 +202,13 @@ pub fn status(root: &Path) -> Result<()> {
 
 /// Where a tool resolves from this process's own `PATH`.
 fn which(tool: &str, path_var: &str) -> String {
-    if tool.contains('/') {
+    if tool.contains('/') || (cfg!(windows) && tool.contains('\\')) {
         return tool.to_string();
     }
+    // Windows programs on `PATH` carry their `.exe`.
+    let file = if cfg!(windows) && Path::new(tool).extension().is_none() { format!("{tool}.exe") } else { tool.to_string() };
     std::env::split_paths(path_var)
-        .map(|dir| dir.join(tool))
+        .map(|dir| dir.join(&file))
         .find(|candidate| candidate.is_file())
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "(not found)".to_string())
@@ -249,9 +267,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
             })
             .collect(),
     };
-    lock.set_len(0)?;
-    lock.write_all(serde_json::to_string_pretty(&info)?.as_bytes())?;
-    lock.flush()?;
+    write_info(root, &mut lock, &info)?;
 
     let log = Log { path: log_path(root) };
     log.line(&format!("ticker {} started (pid {})", info.version, info.pid));
@@ -913,7 +929,7 @@ mod tests {
         assert_eq!(lock_state(root.path()), LockState::Free);
         let mut file = File::options().create(true).write(true).truncate(false).open(lock_path(root.path())).unwrap();
         file.lock().unwrap();
-        file.write_all(br#"{"version":"v9","pid":1}"#).unwrap();
+        write_info(root.path(), &mut file, &Info { version: "v9".into(), pid: 1, ..Info::default() }).unwrap();
         match lock_state(root.path()) {
             LockState::Held(info) => assert_eq!(info.version, "v9"),
             LockState::Free => panic!("lock should be held"),
@@ -970,7 +986,7 @@ mod tests {
     }
 
     fn with_cwd(json: &str, fixture: &Fixture) -> String {
-        json.replace("CWD", &fixture.project.dir().to_string_lossy())
+        json.replace("CWD", &crate::scenarios::json_path(&fixture.project.dir().to_string_lossy()))
     }
 
     #[test]

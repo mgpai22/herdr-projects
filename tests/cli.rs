@@ -25,11 +25,14 @@ fn context_prints_a_usable_prefix_in_a_scrubbed_environment() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let text = String::from_utf8(out.stdout).unwrap();
     let prefix = text.lines().next().unwrap().strip_prefix("Commands: ").unwrap();
-    // Fixed shape `<binary> --root <root>`, with the spaced root shell-quoted.
-    assert_eq!(prefix, format!("{BIN} --root '{root_arg}'"));
+    // Fixed shape `<binary> --root <root>`, with the spaced root shell-quoted
+    // (on Windows with `/`, for Git Bash).
+    let shell_form = |p: &str| if cfg!(windows) { p.replace('\\', "/") } else { p.to_string() };
+    assert_eq!(prefix, format!("{} --root '{}'", shell_form(BIN), shell_form(root_arg)));
 
     // The printed prefix works as typed, from a bare shell.
-    let listed = Command::new("/bin/sh")
+    let shell = if cfg!(windows) { format!(r"{}\Git\bin\bash.exe", std::env::var("ProgramFiles").unwrap()) } else { "/bin/sh".to_string() };
+    let listed = Command::new(shell)
         .env_clear()
         .env("HOME", home.path())
         .args(["-c", &format!("{prefix} list")])
@@ -92,7 +95,10 @@ fn configure_and_unconfigure_for_omp_touch_only_our_extension() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let text = std::fs::read_to_string(extensions.join("herdr-projects.ts")).unwrap();
     assert!(text.starts_with("// HERDR_PROJECTS_OMP_VERSION=") && !text.contains("__HP_"), "{text}");
-    assert!(text.contains(&format!("\"{}\"", std::fs::canonicalize(BIN).unwrap().display())));
+    // The binary's resolved path as a JSON string (Windows: no `\\?\` prefix).
+    let bin = std::fs::canonicalize(BIN).unwrap().display().to_string();
+    let bin = bin.strip_prefix(r"\\?\").unwrap_or(&bin);
+    assert!(text.contains(&serde_json::to_string(bin).unwrap()), "{text}");
     // The extension's hook bridge parses and never fails.
     assert!(omp(&["hook", "--agent", "omp"]).status.success());
 

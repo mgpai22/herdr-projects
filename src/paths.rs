@@ -20,10 +20,13 @@ pub struct Env {
 
 impl Env {
     pub fn from_process() -> Result<Self> {
-        let vars: BTreeMap<String, String> = std::env::vars().collect();
+        // Windows variable names are case-insensitive (`Path` is `PATH`).
+        let vars: BTreeMap<String, String> = std::env::vars().map(|(k, v)| (if cfg!(windows) { k.to_ascii_uppercase() } else { k }, v)).collect();
+        // Windows: native processes get `USERPROFILE`; only Git Bash sets `HOME`.
         let home = vars
             .get("HOME")
             .filter(|h| !h.is_empty())
+            .or_else(|| if cfg!(windows) { vars.get("USERPROFILE").filter(|h| !h.is_empty()) } else { None })
             .map(PathBuf::from)
             .context("HOME is not set")?;
         Ok(Env { vars, home })
@@ -68,7 +71,38 @@ impl Env {
 /// hooks, AGENTS.md or the tab bar survives `~/.local/bin` links changing.
 pub fn binary() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("could not find this binary's own path")?;
-    Ok(std::fs::canonicalize(&exe).unwrap_or(exe))
+    Ok(canonicalize(&exe).unwrap_or(exe))
+}
+
+/// `std::fs::canonicalize`, but on Windows without the `\\?\` prefix it adds,
+/// so the path compares equal to what herdr, git and shells report.
+pub fn canonicalize(path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let mut components = canonical.components();
+        if let Some(Component::Prefix(prefix)) = components.next() {
+            let standard = match prefix.kind() {
+                Prefix::VerbatimDisk(drive) => Some(PathBuf::from(format!("{}:\\", char::from(drive)))),
+                Prefix::VerbatimUNC(server, share) => Some(PathBuf::from(r"\\").join(server).join(share)),
+                _ => None,
+            };
+            if let Some(mut standard) = standard {
+                standard.extend(components.filter(|c| !matches!(c, Component::RootDir)));
+                return Ok(standard);
+            }
+        }
+    }
+    Ok(canonical)
+}
+
+/// A local path as a shell command should spell it. On Windows the commands
+/// run under Git Bash, so separators become `/` (`C:/Users/...`), which Git
+/// Bash and native programs both accept and which never needs escaping.
+pub fn shell_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) { text.replace('\\', "/") } else { text.into_owned() }
 }
 
 /// What every subcommand works from: the environment, the resolved root and
@@ -190,10 +224,11 @@ mod tests {
 
         let env = Env::for_test(home.path(), &[("HERDR_PROJECTS_ROOT", "/from-env")]);
         let flag = PathBuf::from("/from-flag");
-        assert_eq!(resolve_root(Some(&flag), &env, &config_dir).unwrap(), flag);
+        // `absolute`: Windows puts the current drive in front of a rooted path.
+        assert_eq!(resolve_root(Some(&flag), &env, &config_dir).unwrap(), absolute(&flag).unwrap());
         assert_eq!(
             resolve_root(None, &env, &config_dir).unwrap(),
-            PathBuf::from("/from-env")
+            absolute(Path::new("/from-env")).unwrap()
         );
 
         let env = Env::for_test(home.path(), &[]);
@@ -255,7 +290,7 @@ mod tests {
             socket: Some("/flag.sock".into()),
         };
         let got = resolve_session(&by_socket, &env, &runner).unwrap();
-        assert_eq!(got, Session { socket: "/flag.sock".into(), name: None });
+        assert_eq!(got, Session { socket: absolute(Path::new("/flag.sock")).unwrap(), name: None });
 
         let none = SessionFlags::default();
         let got = resolve_session(&none, &env, &runner).unwrap();

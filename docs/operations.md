@@ -187,6 +187,14 @@ herdr-projects configure --clients omp        # or claude,codex,omp
 
 `herdr-projects update` refuses on a fork build. To update, run `git -C ~/dev/herdr-projects-omp pull`, then `HERDR_PROJECTS_BUILD=source sh scripts/install.sh` in the checkout, then `herdr-projects doctor --fix`, `herdr-projects ticker stop` and `herdr-projects ticker start`.
 
+**Windows.** The fork runs natively on Windows 11 with Git for Windows installed. In PowerShell, after `git clone` and `herdr plugin link` as above, build with `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1` in the checkout (Herdr runs the same script as the plugin's build step; it always builds `target\release\herdr-projects.exe` with `cargo build --release --locked`). Differences from Linux and macOS:
+
+- Command routines, the coordinator's printed commands and the Claude Code and Codex hooks run under Git Bash (`bash.exe` on `PATH`, else `C:\Program Files\Git\bin\bash.exe`; WSL's `System32\bash.exe` is never used). The binary and root appear with `/` separators (`C:/Users/...`), so set OMP's shell to Git Bash for the `.omp/config.yml` rules to match.
+- The tab-bar entry runs under `cmd.exe`, so `configure` writes it with double quotes.
+- Links are symbolic links (Developer Mode on). Without the symbolic-link privilege, `CLAUDE.md` is a copy of `AGENTS.md`, refreshed on each write, and a skill link is a directory junction.
+- A thread's library is copied in process: Windows has no `du` or `rsync`. Threads on saved machines still need those machines to be POSIX hosts.
+- `HOME` wins when set; otherwise the home folder is `USERPROFILE`.
+
 **What `configure` installs.** `configure` picks OMP by itself when an OMP agent folder exists. It installs into every OMP profile: the default profile's agent folder is `$PI_CODING_AGENT_DIR` when that is set, else `~/.omp/agent`; a named profile's is `~/.omp/profiles/<name>/agent`, one for each such folder. OMP layouts moved to XDG folders are not supported. If you set `PI_CODING_AGENT_DIR`, set the same value in the shell where you run `configure` and in the Herdr server's environment: the Herdr **doctor** and **configure** actions run with the server's environment, and with a different value they look in another folder and install a second copy there. A profile created later gets its copy from the next `configure`.
 
 - `<agent folder>/extensions/herdr-projects.ts` in each profile, with this binary's path and root written into it. `unconfigure` removes it only when it is unchanged. `doctor` reports each profile's copy (`omp extension <profile>`) as ok, outdated, missing or foreign; `doctor --fix` rewrites it only when `configure` installed it for this root; a copy left over from `unconfigure`, or one installed for another root, is reported with the command to run. A file of that name that is not ours is never touched.

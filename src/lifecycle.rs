@@ -130,6 +130,11 @@ pub fn delete(ctx: &Ctx, slug: &str, force: bool) -> Result<()> {
         // Held while the folder moves, so no writer lands in between; writers
         // re-check PROJECT.md after taking the lock and drop their write.
         let _lock = project.lock()?;
+        // Windows cannot rename a folder while a file in it is open, the lock
+        // file included: it is let go first. A writer that opens a file in
+        // between makes the move fail (retry), never loses its write.
+        #[cfg(windows)]
+        drop(_lock);
         std::fs::rename(project.dir(), &target).with_context(|| format!("could not move {} to the trash", project.dir().display()))?;
     }
     println!("moved `{slug}` to {}", target.display());

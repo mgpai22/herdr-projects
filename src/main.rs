@@ -41,6 +41,8 @@ pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("HP_BUILD
 /// minimal `PATH`, so `gh`, `rsync` or the agent CLI may be missing for the
 /// ticker although they work in the user's terminal. The usual install folders
 /// are appended (never prepended: what the user's `PATH` resolves still wins).
+/// Windows plugins inherit the user's full `PATH`, and these folders are Unix ones.
+#[cfg(unix)]
 fn extend_path() {
     let current = std::env::var_os("PATH").unwrap_or_default();
     let mut dirs: Vec<std::path::PathBuf> = std::env::split_paths(&current).collect();
@@ -62,6 +64,7 @@ fn extend_path() {
 }
 
 fn main() {
+    #[cfg(unix)]
     extend_path();
     if let Err(error) = cli::run() {
         eprintln!("herdr-projects: {error:#}");

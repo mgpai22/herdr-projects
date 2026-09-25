@@ -91,7 +91,7 @@ herdr-projects update --check   # only print the installed and the newest versio
 
 ## OMP fork
 
-This fork (branch `omp`) adds [OMP](https://github.com/can1357/oh-my-pi) as a coordinator and thread harness. It has no release binaries: clone it, `herdr plugin link` the checkout, run `HERDR_PROJECTS_BUILD=source sh scripts/install.sh` in it, then `herdr-projects configure --clients omp`. `update` refuses on a fork build; update with `git pull` and the same install command.
+This fork (branch `omp`) adds [OMP](https://github.com/can1357/oh-my-pi) as a coordinator and thread harness. It has no release binaries: clone it, `herdr plugin link` the checkout, run `HERDR_PROJECTS_BUILD=source sh scripts/install.sh` in it, then `herdr-projects configure --clients omp`. `update` refuses on a fork build; update with `git pull` and the same install command. On Windows, build with `scripts\install.ps1` instead; see [Operations: OMP](docs/operations.md#omp).
 
 - `configure` installs an OMP extension and links the `autoproject` skill in every OMP profile: `~/.omp/agent` (or `$PI_CODING_AGENT_DIR`) and each `~/.omp/profiles/<name>/agent`.
 - The extension gives OMP the same progress instructions as the Claude Code and Codex hooks, reports progress from the agent's todo list, and takes the binary's prompts through a file queue instead of typed keystrokes, so a prompt never merges with half-typed text.

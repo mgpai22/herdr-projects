@@ -247,6 +247,9 @@ fn run_binary(ctx: &Ctx, binary: &Path, args: &[&str]) -> Result<bool> {
 pub fn run(ctx: &Ctx, check_only: bool) -> Result<()> {
     if fork_build() {
         let root = own_root().map_or_else(|| "<plugin root>".to_string(), |r| r.display().to_string());
+        if cfg!(windows) {
+            bail!("this is the OMP fork build; update with `git -C {root} pull` and reinstall with `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\install.ps1` in {root}");
+        }
         bail!("this is the OMP fork build; update with `git -C {root} pull` and reinstall with HERDR_PROJECTS_BUILD=source (`HERDR_PROJECTS_BUILD=source sh scripts/install.sh` in {root})");
     }
     let bin = ctx.env.herdr_bin();
@@ -400,7 +403,8 @@ mod tests {
         let ctx = Ctx { env: &env, root: home.path().join("root"), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: false };
         for check_only in [false, true] {
             let error = run(&ctx, check_only).unwrap_err().to_string();
-            assert!(error.contains("OMP fork build") && error.contains("HERDR_PROJECTS_BUILD=source"), "{error}");
+            let hint = if cfg!(windows) { "scripts\\install.ps1" } else { "HERDR_PROJECTS_BUILD=source" };
+            assert!(error.contains("OMP fork build") && error.contains(hint), "{error}");
         }
         assert!(runner.calls.borrow().is_empty(), "the fork build asked Herdr or git");
     }

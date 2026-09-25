@@ -550,7 +550,6 @@ mod tests {
 
     #[test]
     fn fix_reports_only_what_it_fixed_and_names_files_it_leaves_alone() {
-        use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
         let env = Env::for_test(home.path(), &[]);
         let runner = runner_with_herdr("herdr 0.9.1\n");
@@ -572,11 +571,15 @@ mod tests {
         assert_eq!(std::fs::read(project.dir().join(project::OMP_CONFIG)).unwrap(), b"\xff\xfe");
 
         // A missing file it cannot write stays reported, with no `fixed`.
-        std::fs::remove_file(project.dir().join(project::OMP_CONFIG)).unwrap();
-        std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, None);
-        std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(text.contains("[warn] files demo: .omp/config.yml is missing\n") && !text.contains("fixed:"), "{text}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::remove_file(project.dir().join(project::OMP_CONFIG)).unwrap();
+            std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, None);
+            std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(text.contains("[warn] files demo: .omp/config.yml is missing\n") && !text.contains("fixed:"), "{text}");
+        }
     }
 
     #[test]
@@ -588,7 +591,7 @@ mod tests {
         let flags = SessionFlags::default();
         project::create(&root, "demo", "", vec![]).unwrap();
         // Unreadable as text: OMP's own config, which the "cannot be read" bucket would tell the user to remove.
-        let config = home.path().join(".omp/agent/config.yml");
+        let config = crate::omp::agent_dir(&env, "").join("config.yml");
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         std::fs::write(&config, b"\xff\xfe").unwrap();
         let (text, _) = report(&env, &root, &home.path().join("cfg"), &flags, &runner, true, None);
@@ -653,7 +656,7 @@ mod tests {
         assert_eq!(crate::setup::skill_state(&link, &moved), crate::setup::SkillState::Ours);
 
         // A directory of the same name is never touched.
-        std::fs::remove_file(&link).unwrap();
+        crate::setup::remove_link(&link).unwrap();
         std::fs::create_dir(&link).unwrap();
         let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, Some(&moved));
         assert!(text.contains("is not this plugin's link"), "{text}");
@@ -767,13 +770,13 @@ mod tests {
         crate::setup::save_journal(&cfg, &[(crate::setup::omp_extension_path(&agent).to_string_lossy().into_owned(), extension)].into()).unwrap();
 
         std::fs::create_dir_all(home.path().join(".agents/skills")).unwrap();
-        std::os::unix::fs::symlink(&source, home.path().join(".agents/skills").join(crate::setup::SKILL)).unwrap();
+        crate::setup::link_dir(&source, &home.path().join(".agents/skills").join(crate::setup::SKILL)).unwrap();
         let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, Some(&source));
         assert!(text.contains("[ok  ] skill omp default: OMP loads the bundled"), "{text}");
         assert_eq!(crate::setup::skill_state(&omp_link, &source), crate::setup::SkillState::Missing);
 
         // Without the shared link, `--fix` links it into OMP's own skills dir.
-        std::fs::remove_file(home.path().join(".agents/skills").join(crate::setup::SKILL)).unwrap();
+        crate::setup::remove_link(&home.path().join(".agents/skills").join(crate::setup::SKILL)).unwrap();
         let (text, _) = report(&env, &root, &cfg, &flags, &runner, true, Some(&source));
         assert!(text.contains("[ok  ] skill omp default: fixed:"), "{text}");
         assert_eq!(crate::setup::skill_state(&omp_link, &source), crate::setup::SkillState::Ours);

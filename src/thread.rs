@@ -1,6 +1,7 @@
 //! Thread records, ids, briefs, groups and the copy home.
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -9,7 +10,9 @@ use sha2::{Digest, Sha256};
 
 use crate::herdr::{Agent, Pane, ready_state};
 use crate::project::{self, Project, slugify, write_atomic};
-use crate::runner::{Cmd, Runner};
+#[cfg(unix)]
+use crate::runner::Cmd;
+use crate::runner::Runner;
 
 pub const STARTING_TIMEOUT_SECS: i64 = 300;
 pub const BLOCKED_DEBOUNCE_SECS: i64 = 30;
@@ -850,13 +853,7 @@ pub fn copy_home_remote(project: &Project, thread: &Thread, with_library: bool, 
 }
 
 fn copy_library_local(project: &Project, thread: &Thread, library: &Path, runner: &dyn Runner) -> Result<Vec<String>> {
-    let du = runner.run(&Cmd::new("du", Duration::from_secs(10)).args(["-sk", &library.to_string_lossy()]))?;
-    let kb: u64 = du
-        .stdout
-        .split_whitespace()
-        .next()
-        .and_then(|n| n.parse().ok())
-        .context("could not measure the library folder")?;
+    let kb = library_kb(library, runner)?;
     if kb > LIBRARY_CAP_KB {
         return Ok(vec![format!(
             "the library is {} MB, over the {} MB cap; nothing from it was copied",
@@ -876,6 +873,22 @@ fn copy_library_local(project: &Project, thread: &Thread, library: &Path, runner
             std::fs::create_dir(&target).with_context(|| format!("could not create {}", target.display()))?;
         }
     }
+    copy_tree(library, &target, runner)?;
+    Ok(notes)
+}
+
+#[cfg(unix)]
+fn library_kb(library: &Path, runner: &dyn Runner) -> Result<u64> {
+    let du = runner.run(&Cmd::new("du", Duration::from_secs(10)).args(["-sk", &library.to_string_lossy()]))?;
+    du.stdout
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .context("could not measure the library folder")
+}
+
+#[cfg(unix)]
+fn copy_tree(library: &Path, target: &Path, runner: &dyn Runner) -> Result<()> {
     // `-rt` without `-l`: symbolic links are skipped, never followed.
     let out = runner.run(
         &Cmd::new("rsync", Duration::from_secs(60)).args([
@@ -887,7 +900,48 @@ fn copy_library_local(project: &Project, thread: &Thread, library: &Path, runner
     if !out.success() {
         bail!("rsync failed: {}", out.error_text());
     }
-    Ok(notes)
+    Ok(())
+}
+
+/// Windows has neither `du` nor `rsync`: the regular files under `dir`, in
+/// kilobytes, never following a link.
+#[cfg(windows)]
+fn library_kb(dir: &Path, _runner: &dyn Runner) -> Result<u64> {
+    fn bytes(dir: &Path) -> std::io::Result<u64> {
+        let mut total = 0;
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            let meta = std::fs::symlink_metadata(&path)?;
+            if meta.is_dir() {
+                total += bytes(&path)?;
+            } else if meta.is_file() {
+                total += meta.len();
+            }
+        }
+        Ok(total)
+    }
+    Ok(bytes(dir).context("could not measure the library folder")?.div_ceil(1024))
+}
+
+/// `rsync -rt` in process: directories and regular files (`CopyFileExW`
+/// keeps modification times); symbolic links and junctions are skipped.
+#[cfg(windows)]
+fn copy_tree(from: &Path, to: &Path, _runner: &dyn Runner) -> Result<()> {
+    fn copy(from: &Path, to: &Path) -> Result<()> {
+        for entry in std::fs::read_dir(from).with_context(|| format!("could not read {}", from.display()))? {
+            let path = entry?.path();
+            let meta = std::fs::symlink_metadata(&path)?;
+            let dest = to.join(path.file_name().context("library entry has no name")?);
+            if meta.is_dir() {
+                std::fs::create_dir_all(&dest)?;
+                copy(&path, &dest)?;
+            } else if meta.is_file() {
+                std::fs::copy(&path, &dest).with_context(|| format!("could not copy {}", path.display()))?;
+            }
+        }
+        Ok(())
+    }
+    copy(from, to)
 }
 
 #[cfg(test)]
@@ -1256,7 +1310,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(home_report_path(&project, &t.id)).unwrap(), "## Report\nok\n");
         assert_eq!(std::fs::read_to_string(project.dir().join("library/t-0001/out.txt")).unwrap(), "data");
 
-        std::os::unix::fs::symlink("/etc/passwd", dir.join("library/link")).unwrap();
+        crate::setup::file_link("/etc/passwd", dir.join("library/link"));
         let copied = copy_home_local(&project, &t, true, &RealRunner);
         assert!(matches!(copied.outcome, CopyOutcome::Partial(_)));
         assert!(!project.dir().join("library/t-0001/link").exists());
@@ -1270,8 +1324,8 @@ mod tests {
         let dir = work.path().join(".herdr-project/demo-t-0001");
         let t = local_thread(&project, &dir);
         std::fs::remove_dir(dir.join("library")).unwrap();
-        std::os::unix::fs::symlink("/etc", dir.join("library")).unwrap();
-        std::os::unix::fs::symlink("/etc/passwd", dir.join("report.md")).unwrap();
+        crate::setup::link_dir(&std::env::temp_dir(), &dir.join("library")).unwrap();
+        crate::setup::file_link("/etc/passwd", dir.join("report.md"));
         let copied = copy_home_local(&project, &t, true, &RealRunner);
         match copied.outcome {
             CopyOutcome::Partial(notes) => assert_eq!(notes.len(), 2, "{notes:?}"),
@@ -1285,13 +1339,14 @@ mod tests {
         std::fs::create_dir(&real).unwrap();
         std::fs::write(real.join("report.md"), "secret").unwrap();
         let linked = work.path().join("linked");
-        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        crate::setup::link_dir(&real, &linked).unwrap();
         let t2 = allocate(&project, |t| t.thread_dir = linked.to_string_lossy().into_owned()).unwrap();
         let copied = copy_home_local(&project, &t2, true, &RealRunner);
         assert!(matches!(copied.outcome, CopyOutcome::Partial(_)));
         assert!(!home_report_path(&project, &t2.id).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn library_over_the_cap_is_not_copied() {
         use crate::runner::fake::{FakeRunner, ok};
@@ -1309,6 +1364,35 @@ mod tests {
         assert!(home_report_path(&project, &t.id).is_file());
     }
 
+    /// Windows measures and copies in process: a library past the cap by
+    /// size, nested folders copied, links left out.
+    #[cfg(windows)]
+    #[test]
+    fn windows_library_copy_measures_nests_and_caps() {
+        use crate::runner::fake::FakeRunner;
+        let root = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        let dir = work.path().join(".herdr-project/demo-t-0001");
+        let t = local_thread(&project, &dir);
+        std::fs::create_dir_all(dir.join("library/sub/deeper")).unwrap();
+        std::fs::write(dir.join("library/sub/deeper/a.txt"), "deep").unwrap();
+        crate::setup::link_dir(work.path(), &dir.join("library/sub/loop")).unwrap();
+        let runner = FakeRunner::new();
+        let copied = copy_home_local(&project, &t, true, &runner);
+        assert!(matches!(&copied.outcome, CopyOutcome::Partial(notes) if notes.len() == 1 && notes[0].contains("loop")), "{:?}", copied.outcome);
+        assert_eq!(std::fs::read_to_string(project.dir().join("library/t-0001/sub/deeper/a.txt")).unwrap(), "deep");
+        assert!(std::fs::symlink_metadata(project.dir().join("library/t-0001/sub/loop")).is_err());
+        assert!(runner.calls.borrow().is_empty(), "no du or rsync on Windows");
+
+        let big = std::fs::File::create(dir.join("library/big.bin")).unwrap();
+        big.set_len((LIBRARY_CAP_KB + 1) * 1024).unwrap();
+        let copied = copy_home_local(&project, &t, true, &runner);
+        assert!(matches!(&copied.outcome, CopyOutcome::Partial(notes) if notes[0].contains("over the 50 MB cap")), "{:?}", copied.outcome);
+        assert!(!project.dir().join("library/t-0001/big.bin").exists());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn failed_rsync_is_a_failed_copy() {
         use crate::runner::fake::{FakeRunner, fail, ok};

@@ -6,6 +6,7 @@
 //! ids sorting by creation. An item being typed is renamed to
 //! `.<id>.typing` first, out of `pull`'s sight.
 
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -108,9 +109,14 @@ fn enqueue(root: &Path, socket: &str, pane: &str, kind: &str, text: &str, now_ms
     let terminal_id = progress::load(root, socket, pane).map(|r| r.terminal_id).unwrap_or_default();
     let item = Item { id: format!("{now_ms:013}-{suffix:08x}"), kind: kind.into(), text: text.into(), socket: socket.into(), pane_id: pane.into(), terminal_id, created_at: now_ms };
     // The text is typed into an agent: only this user may read or add items.
-    let top = dir(root);
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(pane_dir(root, socket, pane))?;
-    std::fs::set_permissions(&top, std::fs::Permissions::from_mode(0o700))?;
+    // On Windows the folder inherits the user profile's ACL instead.
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(pane_dir(root, socket, pane))?;
+    #[cfg(unix)]
+    std::fs::set_permissions(dir(root), std::fs::Permissions::from_mode(0o700))?;
     crate::project::write_json(&item_path(root, &item), &item)?;
     Ok(item)
 }
@@ -348,8 +354,11 @@ mod tests {
         std::fs::rename(item_path(root, &typing), pane_dir(root, SOCKET, "w1:p1").join(format!(".{}.typing", typing.id))).unwrap();
 
         assert_eq!(pending(root, SOCKET, "w1:p1"), [first, second]);
-        let mode = std::fs::metadata(dir(root)).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o700);
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(dir(root)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
     }
 
     #[test]

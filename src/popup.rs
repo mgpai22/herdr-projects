@@ -1136,13 +1136,14 @@ fn focus(ctx: &Ctx, socket: &str, machine: &str, pane: &str) {
     if herdr.agent_focus(pane).is_ok() {
         return;
     }
-    use std::os::unix::process::CommandExt;
     let mut args = Vec::new();
     if !machine.is_empty() {
         args.extend(["--machine".to_string(), machine.to_string()]);
     }
     args.extend(["agent".to_string(), "focus".to_string(), pane.to_string()]);
-    let mut command = std::process::Command::new("/bin/sh");
+    // `/bin/sh` (Git Bash on Windows) sleeps, then becomes the herdr call.
+    let shell = if cfg!(windows) { crate::runner::posix_shell() } else { "/bin/sh".to_string() };
+    let mut command = std::process::Command::new(shell);
     command
         .args(["-c", "sleep 0.2; exec \"$@\"", "sh", &ctx.env.herdr_bin()])
         .args(&args)
@@ -1150,16 +1151,7 @@ fn focus(ctx: &Ctx, socket: &str, machine: &str, pane: &str) {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    unsafe {
-        command.pre_exec(|| {
-            unsafe extern "C" {
-                fn setsid() -> i32;
-            }
-            setsid();
-            Ok(())
-        });
-    }
-    let _ = command.spawn();
+    let _ = crate::runner::spawn_detached(&mut command);
 }
 
 /// The popup's loop, on the terminal Herdr gives the popup (or any terminal,

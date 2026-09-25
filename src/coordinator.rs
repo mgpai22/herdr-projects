@@ -24,11 +24,12 @@ pub const NUDGE_IDLE_SECS: i64 = 60;
 
 /// `<binary> --root <root>`: the fixed shape every printed command starts
 /// with, so allow-list patterns can match on it. Values with spaces are quoted.
+/// On Windows the paths use `/`, for the Git Bash the agents' shell tool runs.
 pub fn command_prefix(binary: &Path, root: &Path) -> String {
     format!(
         "{} --root {}",
-        quote(&binary.to_string_lossy()),
-        quote(&root.to_string_lossy())
+        quote(&paths::shell_path(binary)),
+        quote(&paths::shell_path(root))
     )
 }
 

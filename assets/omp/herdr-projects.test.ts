@@ -5,14 +5,43 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const dir = mkdtempSync(join(tmpdir(), "hp-omp-ext-"));
-const binary = join(dir, "herdr-projects");
+const windows = process.platform === "win32";
+// Windows spawns no shebang script and no `.cmd` without a shell: the fake
+// there is the same logic compiled to an `.exe` with `bun build --compile`.
+const binary = join(dir, windows ? "herdr-projects.exe" : "herdr-projects");
 const log = join(dir, "calls.log");
 // Logs "argv<TAB>stdin" per call and answers from canned files: hook-<Event>.json
 // for `hook`, pull.json (consumed once, else pull-default.json) for `channel pull`,
-// which sleeps 1 s while pull-slow exists.
-writeFileSync(
-  binary,
-  `#!/bin/sh
+// which sleeps 1 s while pull-slow exists (the slow pull a test waits behind).
+if (windows) {
+  const source = join(dir, "fake.ts");
+  writeFileSync(
+    source,
+    `import { appendFileSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
+const dir = dirname(process.execPath);
+const args = process.argv.slice(2).join(" ");
+const input = (await Bun.stdin.text()).replace(/\\n+$/, "");
+appendFileSync(join(dir, "calls.log"), args + "\\t" + input + "\\n");
+let f = "";
+if (args.includes("hook --agent omp")) f = join(dir, "hook-" + (/"hook_event_name":"([A-Za-z]*)"/.exec(input)?.[1] ?? "") + ".json");
+else if (args.includes("channel pull")) {
+  if (existsSync(join(dir, "pull-slow"))) await Bun.sleep(1000);
+  f = join(dir, "pull.json");
+  if (!existsSync(f)) f = join(dir, "pull-default.json");
+}
+if (f && existsSync(f)) {
+  process.stdout.write(readFileSync(f));
+  if (f.endsWith("pull.json")) rmSync(f);
+}
+`,
+  );
+  const built = Bun.spawnSync([process.execPath, "build", "--compile", source, "--outfile", binary]);
+  if (!built.success) throw new Error(`could not build the fake binary: ${built.stderr}`);
+} else {
+  writeFileSync(
+    binary,
+    `#!/bin/sh
 dir=$(dirname "$0")
 input=$(cat)
 printf '%s\\t%s\\n' "$*" "$input" >> "$dir/calls.log"
@@ -23,8 +52,9 @@ case "$*" in
 esac
 if [ -n "$f" ] && [ -f "$f" ]; then cat "$f"; case "$f" in */pull.json) rm -f "$f" ;; esac; fi
 `,
-);
-chmodSync(binary, 0o755);
+  );
+  chmodSync(binary, 0o755);
+}
 
 const asset = readFileSync(join(import.meta.dir, "herdr-projects.ts"), "utf8");
 let renders = 0;

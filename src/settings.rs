@@ -153,7 +153,7 @@ pub fn set_in(text: &str, key: &str, value: &str) -> Result<String> {
             }
             let path = match repo.machine {
                 Some(_) => repo.path.clone(),
-                None => std::fs::canonicalize(&repo.path).map(|p| p.to_string_lossy().into_owned()).unwrap_or(repo.path.clone()),
+                None => crate::paths::canonicalize(&repo.path).map(|p| p.to_string_lossy().into_owned()).unwrap_or(repo.path.clone()),
             };
             normalize_repos(&mut doc)?;
             let repos = doc["repos"].as_array_of_tables_mut().context("`repos` must be [[repos]] tables")?;
@@ -237,7 +237,7 @@ pub fn is_text(path: &Path) -> bool {
 /// `open-file <path> [--workspace W]`: a text file opens in a new Herdr tab
 /// running `$EDITOR`; anything else with the system opener. No viewer.
 pub fn open_file(ctx: &Ctx, path: &Path, workspace: Option<&str>) -> Result<()> {
-    let path = std::fs::canonicalize(path).with_context(|| format!("{} does not exist", path.display()))?;
+    let path = crate::paths::canonicalize(path).with_context(|| format!("{} does not exist", path.display()))?;
     if path.is_dir() || !is_text(&path) {
         return system_open(ctx, &path.to_string_lossy());
     }
@@ -253,8 +253,11 @@ pub fn open_file(ctx: &Ctx, path: &Path, workspace: Option<&str>) -> Result<()> 
     }
     let created = herdr.call(&args, crate::herdr::CALL_TIMEOUT).map_err(|e| anyhow::anyhow!("{e}"))?;
     let pane = created["root_pane"]["pane_id"].as_str().context("herdr's tab reply has no pane")?.to_string();
-    let editor = ctx.env.var("VISUAL").or(ctx.env.var("EDITOR")).unwrap_or("vi");
-    let command = format!("{editor} {}", crate::remote::quote(&path.to_string_lossy()));
+    // The pane runs the user's shell: POSIX quoting there, and on Windows
+    // (PowerShell or cmd) double quotes, which a Windows path never contains.
+    let (default_editor, quoted) = if cfg!(windows) { ("notepad", format!("\"{}\"", path.display())) } else { ("vi", crate::remote::quote(&path.to_string_lossy())) };
+    let editor = ctx.env.var("VISUAL").or(ctx.env.var("EDITOR")).unwrap_or(default_editor);
+    let command = format!("{editor} {quoted}");
     // A fresh pane's shell needs a moment before it takes input.
     std::thread::sleep(std::time::Duration::from_millis(300));
     herdr.call(&["pane", "run", &pane, &command], crate::herdr::CALL_TIMEOUT).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -262,10 +265,17 @@ pub fn open_file(ctx: &Ctx, path: &Path, workspace: Option<&str>) -> Result<()> 
     Ok(())
 }
 
-/// A URL or a non-text file with the system opener (`open` / `xdg-open`).
+/// A URL or a non-text file with the system opener (`open` / `xdg-open`, and
+/// on Windows the shell's file-protocol handler, which exits 0 on success).
 pub fn system_open(ctx: &Ctx, target: &str) -> Result<()> {
-    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    let out = ctx.runner.run(&crate::runner::Cmd::new(opener, std::time::Duration::from_secs(10)).arg(target))?;
+    let (opener, args) = if cfg!(target_os = "macos") {
+        ("open", vec![target])
+    } else if cfg!(windows) {
+        ("rundll32", vec!["url.dll,FileProtocolHandler", target])
+    } else {
+        ("xdg-open", vec![target])
+    };
+    let out = ctx.runner.run(&crate::runner::Cmd::new(opener, std::time::Duration::from_secs(10)).args(args))?;
     if !out.success() {
         bail!("{opener} {target}: {}", out.error_text());
     }
