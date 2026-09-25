@@ -1792,7 +1792,7 @@ fn a_tab_thread_of_a_coordinator_running_in_another_workspace_opens_the_project_
 
 /// Herdr's default socket, where the ticker looks for hand-started agents.
 fn default_socket(world: &World) -> String {
-    let socket = world.home.path().join(".config/herdr/herdr.sock");
+    let socket = world.home.path().join(".config").join("herdr").join("herdr.sock");
     std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
     std::fs::write(&socket, b"").unwrap();
     socket.to_string_lossy().into_owned()
