@@ -187,6 +187,13 @@ pub fn hook_command(binary: &Path, root: &Path, agent: &str) -> String {
     format!("{} --root {} hook --agent {agent} 2>/dev/null || true", quote(&crate::paths::shell_path(binary)), quote(&crate::paths::shell_path(root)))
 }
 
+/// The harnesses whose hook file `configure` edits. Not Codex on Windows:
+/// there Codex runs a hook through the user's shell (cmd, PowerShell or Git
+/// Bash), and no single hook command line works in all three.
+pub fn hook_agents() -> &'static [&'static str] {
+    if cfg!(windows) { &["claude"] } else { &["claude", "codex"] }
+}
+
 /// Where each harness keeps its hooks.
 pub fn hook_file(env: &Env, agent: &str, claude_home: Option<&Path>, codex_home: Option<&Path>) -> PathBuf {
     match agent {
@@ -383,6 +390,10 @@ pub fn configure(ctx: &Ctx, options: &ConfigureOptions) -> Result<Vec<String>> {
     let mut edits: Vec<(PathBuf, Owned)> = Vec::new();
     let mut notes = Vec::new();
     for client in clients.iter().filter(|c| options.hooks && matches!(c.as_str(), "claude" | "codex")) {
+        if !hook_agents().contains(&client.as_str()) {
+            notes.push(format!("{client}: no hooks installed on Windows; {client} runs hooks through your own shell (cmd, PowerShell or Git Bash), and no single hook command works in all of them"));
+            continue;
+        }
         let file = hook_file(ctx.env, client, options.claude_home.as_deref(), options.codex_home.as_deref());
         let command = hook_command(&binary, &ctx.root, client);
         let before = read(&file)?;
@@ -796,9 +807,10 @@ mod tests {
         let configured = std::fs::read_to_string(claude.join("settings.json")).unwrap();
         assert!(configured.contains("// mine") && configured.contains("say done"));
         assert_eq!(configured.matches("hook --agent claude").count(), 3);
-        let codex_text = std::fs::read_to_string(codex.join("hooks.json")).unwrap();
-        assert_eq!(codex_text.matches("hook --agent codex").count(), 3);
-        assert_eq!(load_journal(&ctx.config_dir).len(), 2);
+        // Codex gets no hooks on Windows (it runs them through the user's shell).
+        let codex_hooks = std::fs::read_to_string(codex.join("hooks.json")).unwrap_or_default();
+        assert_eq!(codex_hooks.matches("hook --agent codex").count(), if cfg!(windows) { 0 } else { 3 });
+        assert_eq!(load_journal(&ctx.config_dir).len(), if cfg!(windows) { 1 } else { 2 });
         // Idempotent.
         configure(&ctx, &options).unwrap();
         assert_eq!(std::fs::read_to_string(claude.join("settings.json")).unwrap(), configured);

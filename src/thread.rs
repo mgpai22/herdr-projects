@@ -933,7 +933,13 @@ fn copy_tree(from: &Path, to: &Path, _runner: &dyn Runner) -> Result<()> {
             let meta = std::fs::symlink_metadata(&path)?;
             let dest = to.join(path.file_name().context("library entry has no name")?);
             if meta.is_dir() {
-                std::fs::create_dir_all(&dest)?;
+                // Never `create_dir_all`: the walk is top-down, so a missing
+                // parent means the project was deleted meanwhile; fail as rsync does.
+                if let Err(e) = std::fs::create_dir(&dest)
+                    && e.kind() != std::io::ErrorKind::AlreadyExists
+                {
+                    return Err(e).with_context(|| format!("could not create {}", dest.display()));
+                }
                 copy(&path, &dest)?;
             } else if meta.is_file() {
                 std::fs::copy(&path, &dest).with_context(|| format!("could not copy {}", path.display()))?;
@@ -1390,6 +1396,27 @@ mod tests {
         let copied = copy_home_local(&project, &t, true, &runner);
         assert!(matches!(&copied.outcome, CopyOutcome::Partial(notes) if notes[0].contains("over the 50 MB cap")), "{:?}", copied.outcome);
         assert!(!project.dir().join("library/t-0001/big.bin").exists());
+    }
+
+    /// A project deleted while its library copy runs is not rebuilt as a bare
+    /// folder tree: the copy fails, as rsync does on Unix.
+    #[cfg(windows)]
+    #[test]
+    fn windows_library_copy_never_recreates_a_deleted_target() {
+        use crate::runner::fake::FakeRunner;
+        let work = tempfile::tempdir().unwrap();
+        let library = work.path().join("library");
+        std::fs::create_dir_all(library.join("sub/deeper")).unwrap();
+        let gone = work.path().join("gone");
+        assert!(copy_tree(&library, &gone.join("library/t-0001"), &FakeRunner::new()).is_err());
+        assert!(!gone.exists(), "the deleted project's folders were recreated");
+
+        // An existing target, copied twice: folders already there are fine.
+        let target = work.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        copy_tree(&library, &target, &FakeRunner::new()).unwrap();
+        copy_tree(&library, &target, &FakeRunner::new()).unwrap();
+        assert!(target.join("sub/deeper").is_dir());
     }
 
     #[cfg(unix)]

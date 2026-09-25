@@ -1091,14 +1091,23 @@ fn fit(text: &str, width: usize) -> String {
     }
 }
 
-/// Copies text to the clipboard with the platform's tool.
+/// Copies text to the clipboard with the platform's tool. Windows' `clip`
+/// takes UTF-16LE input as Unicode; with a byte-order mark it would copy the
+/// mark as a character too, so there is none.
 fn copy(text: &str) -> String {
     use std::process::{Command, Stdio};
+    #[cfg(not(windows))]
     let tools: &[(&str, &[&str])] = if cfg!(target_os = "macos") { &[("pbcopy", &[])] } else { &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"]), ("xsel", &["--clipboard", "--input"])] };
+    #[cfg(not(windows))]
+    let bytes = text.as_bytes();
+    #[cfg(windows)]
+    let tools: &[(&str, &[&str])] = &[("clip", &[])];
+    #[cfg(windows)]
+    let bytes: &[u8] = &text.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
     for (tool, args) in tools {
         if let Ok(mut child) = Command::new(tool).args(*args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
             if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
+                let _ = stdin.write_all(bytes);
             }
             if child.wait().is_ok_and(|s| s.success()) {
                 return format!("copied {text}");
@@ -1386,5 +1395,18 @@ mod tests {
         assert_eq!(slugs, [None, Some("demo")]);
         assert_eq!(rows[0].status, "1 project · 1 need you");
         assert_eq!(rows[1].status, "1 need you");
+    }
+
+    /// `y` puts the exact path on the Windows clipboard, non-ASCII included.
+    #[cfg(windows)]
+    #[test]
+    fn windows_copy_puts_the_exact_path_on_the_clipboard() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("clipboard.txt");
+        let path = r"C:\Users\Zoë\路径\report.md";
+        assert_eq!(copy(path), format!("copied {path}"));
+        let read = format!("[IO.File]::WriteAllText('{}', (Get-Clipboard -Raw))", out.display());
+        assert!(std::process::Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &read]).status().unwrap().success());
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), path);
     }
 }

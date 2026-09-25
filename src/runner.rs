@@ -161,18 +161,25 @@ impl Runner for RealRunner {
             command.process_group(0);
         }
         // No console window for a child of the windowless ticker; its own group
-        // when asked, so the tree is killed as one.
+        // when asked, so the tree is killed as one. That child starts suspended
+        // and runs only once it is in its job, so nothing it starts escapes.
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            command.creation_flags(CREATE_NO_WINDOW | if cmd.own_group { CREATE_NEW_PROCESS_GROUP } else { 0 });
+            command.creation_flags(CREATE_NO_WINDOW | if cmd.own_group { CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED } else { 0 });
         }
 
         let mut child = command
             .spawn()
             .with_context(|| format!("could not run `{}`", cmd.program))?;
         #[cfg(windows)]
-        let job = if cmd.own_group { Job::assign(&child) } else { None };
+        let job = if cmd.own_group {
+            Job::start(&child).inspect_err(|_| {
+                let _ = child.kill();
+            }).with_context(|| format!("could not start `{}`", cmd.program))?
+        } else {
+            None
+        };
 
         // Readers and the writer run on their own threads so a full pipe in
         // either direction cannot deadlock against the deadline loop below.
@@ -225,7 +232,11 @@ impl Runner for RealRunner {
     }
 
     fn run_foreground(&self, cmd: &Cmd, poll: &mut dyn FnMut() -> bool) -> Result<Option<i32>> {
+        #[cfg(unix)]
         let mut command = Command::new(&cmd.program);
+        // An npm-installed agent is `claude.cmd`; std looks for `<name>.exe` only.
+        #[cfg(windows)]
+        let mut command = Command::new(windows_program(&cmd.program, &std::env::var_os("PATH").unwrap_or_default(), &std::env::var("PATHEXT").unwrap_or_default()));
         command.args(&cmd.args);
         for key in &cmd.env_remove {
             command.env_remove(key);
@@ -283,6 +294,24 @@ pub fn posix_shell() -> String {
     "sh".to_string()
 }
 
+/// `program` as cmd.exe finds it: each `PATH` folder in turn, trying each
+/// `PATHEXT` extension. A `.cmd` or `.bat` match runs through std's batch-file
+/// launcher (`cmd.exe /d /c`, with its argument escaping). Unchanged when it
+/// has a folder or nothing matches.
+#[cfg(windows)]
+fn windows_program(program: &str, path: &std::ffi::OsStr, pathext: &str) -> PathBuf {
+    if program.contains(['/', '\\']) {
+        return PathBuf::from(program);
+    }
+    let mut names = Vec::new();
+    if Path::new(program).extension().is_some() {
+        names.push(program.to_string());
+    }
+    let extensions = if pathext.trim().is_empty() { ".COM;.EXE;.BAT;.CMD" } else { pathext };
+    names.extend(extensions.split(';').map(str::trim).filter(|e| !e.is_empty()).map(|e| format!("{program}{e}")));
+    std::env::split_paths(path).find_map(|dir| names.iter().map(|name| dir.join(name)).find(|candidate| candidate.is_file())).unwrap_or_else(|| PathBuf::from(program))
+}
+
 /// Starts `command` so it outlives this process and its terminal. Unix: a new
 /// session. Windows: no console, its own process group, and out of herdr's
 /// pane job when the job allows breaking away.
@@ -335,6 +364,8 @@ pub fn spawn_detached(command: &mut Command) -> std::io::Result<()> {
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
+const CREATE_SUSPENDED: u32 = 0x0000_0004;
 
 #[cfg(unix)]
 unsafe extern "C" {
@@ -497,6 +528,9 @@ fn kill(child: &mut std::process::Child, own_group: bool) {
 /// `taskkill /T` is not enough: it walks parent process ids, and a program a
 /// Git Bash script `exec`s is not a child of that shell in Windows' eyes, so
 /// it would keep the pipes open. Every descendant inherits the job.
+/// No JOB_OBJECT_LIMIT_BREAKAWAY_OK: Git Bash's runtime starts programs with
+/// CREATE_BREAKAWAY_FROM_JOB when a job allows it, so nothing a script runs
+/// would stay in the job. A program the routine detached dies with it too.
 #[cfg(windows)]
 struct Job(isize);
 
@@ -510,20 +544,31 @@ unsafe extern "system" {
 }
 
 #[cfg(windows)]
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    /// Resumes every thread of a process; std does not expose the thread handle.
+    fn NtResumeProcess(process: isize) -> i32;
+}
+
+#[cfg(windows)]
 impl Job {
-    /// `None` when Windows refuses; the child alone is then killed on timeout.
-    // ponytail: assigned right after spawn, so a grandchild started in the first
-    // instant escapes; CREATE_SUSPENDED needs the thread handle std hides.
-    fn assign(child: &std::process::Child) -> Option<Job> {
+    /// Puts the suspended `child` in a new job, then resumes it. `None` when
+    /// Windows refuses the job; the child alone is then killed on timeout.
+    fn start(child: &std::process::Child) -> std::io::Result<Option<Job>> {
         use std::os::windows::io::AsRawHandle;
-        // SAFETY: plain handle calls; the job handle is owned by the returned value.
+        let process = child.as_raw_handle() as isize;
+        // SAFETY: plain handle calls on a live process handle; the job handle
+        // is owned by the returned value.
         unsafe {
-            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if job == 0 {
-                return None;
+            let job = match CreateJobObjectW(std::ptr::null(), std::ptr::null()) {
+                0 => None,
+                handle => Some(Job(handle)),
+            };
+            let job = job.filter(|job| AssignProcessToJobObject(job.0, process) != 0);
+            match NtResumeProcess(process) {
+                0 => Ok(job),
+                status => Err(std::io::Error::other(format!("NtResumeProcess failed with status {status:#x}"))),
             }
-            let job = Job(job);
-            (AssignProcessToJobObject(job.0, child.as_raw_handle() as isize) != 0).then_some(job)
         }
     }
 
@@ -536,7 +581,7 @@ impl Job {
 #[cfg(windows)]
 impl Drop for Job {
     fn drop(&mut self) {
-        // SAFETY: closes the handle `assign` created; without kill-on-close the
+        // SAFETY: closes the handle `start` created; without kill-on-close the
         // processes live on, as a finished group's leftovers do on Unix.
         unsafe { CloseHandle(self.0) };
     }
@@ -778,5 +823,27 @@ mod tests {
         assert_eq!(reply, "{\"echo\":{\"id\":\"hp\"}}\n");
         assert_eq!(server.join().unwrap(), "{\"id\":\"hp\"}\n");
         assert!(RealRunner.socket_request(&socket.with_extension("none"), "{}", Duration::from_secs(1)).is_err());
+    }
+
+    /// `open` in the current pane finds an npm-installed agent (`claude.cmd`)
+    /// the way cmd.exe does and runs it with its arguments intact.
+    #[cfg(windows)]
+    #[test]
+    fn an_agent_installed_as_a_cmd_file_is_found_and_run() {
+        let first = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::write(bin.path().join("hp-agent.cmd"), "@echo [%~1] [%~2]> \"%~dp0out.txt\"\r\n@exit /b 3\r\n").unwrap();
+        std::fs::write(bin.path().join("hp-agent"), "not a program").unwrap();
+        let path = std::env::join_paths([first.path(), bin.path()]).unwrap();
+        let found = windows_program("hp-agent", &path, ".COM;.EXE;.BAT;.CMD");
+        // PATHEXT is upper case, so is the match; std runs `.CMD` as a batch file too.
+        assert_eq!(found, bin.path().join("hp-agent.CMD"));
+        assert_eq!(windows_program("hp-agent", &path, ""), found, "PATHEXT unset");
+        assert_eq!(windows_program("hp-missing", &path, ".EXE;.CMD"), PathBuf::from("hp-missing"));
+        assert_eq!(windows_program(r"C:\x\hp-agent", &path, ".CMD"), PathBuf::from(r"C:\x\hp-agent"));
+
+        let cmd = Cmd::new(found.to_string_lossy(), Duration::ZERO).args(["two words", "x"]);
+        assert_eq!(RealRunner.run_foreground(&cmd, &mut || true).unwrap(), Some(3));
+        assert_eq!(std::fs::read_to_string(bin.path().join("out.txt")).unwrap(), "[two words] [x]\r\n");
     }
 }

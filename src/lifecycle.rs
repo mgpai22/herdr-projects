@@ -119,6 +119,17 @@ pub fn delete(ctx: &Ctx, slug: &str, force: bool) -> Result<()> {
             }
         }
     }
+    // Windows cannot move a folder that a running process has as its current
+    // directory, and the project's shells and agents do: --force closes them.
+    #[cfg(windows)]
+    if force && let Some(view) = threads::session_view(ctx, &project) {
+        for (what, pane, _) in alive_panes(&project, &view) {
+            match view.herdr.pane_close(&pane) {
+                Ok(()) => println!("closed {what} (pane {pane})"),
+                Err(error) => println!("could not close {what} (pane {pane}): {error}"),
+            }
+        }
+    }
     let threads = thread::list(&project);
     let canonical = project.canonical_dir();
 
@@ -135,7 +146,7 @@ pub fn delete(ctx: &Ctx, slug: &str, force: bool) -> Result<()> {
         // between makes the move fail (retry), never loses its write.
         #[cfg(windows)]
         drop(_lock);
-        std::fs::rename(project.dir(), &target).with_context(|| format!("could not move {} to the trash", project.dir().display()))?;
+        move_to_trash(ctx, &project, &target)?;
     }
     println!("moved `{slug}` to {}", target.display());
 
@@ -155,6 +166,32 @@ pub fn delete(ctx: &Ctx, slug: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn move_to_trash(_ctx: &Ctx, project: &Project, target: &std::path::Path) -> Result<()> {
+    std::fs::rename(project.dir(), target).with_context(|| format!("could not move {} to the trash", project.dir().display()))
+}
+
+/// Windows refuses the move while any process has a file or its current
+/// directory in the folder (ERROR_SHARING_VIOLATION or ERROR_ACCESS_DENIED):
+/// a ticker write or a pane that is closing lets go within moments, so the
+/// move is retried for about two seconds.
+#[cfg(windows)]
+fn move_to_trash(ctx: &Ctx, project: &Project, target: &std::path::Path) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match std::fs::rename(project.dir(), target) {
+            Ok(()) => return Ok(()),
+            Err(e) if matches!(e.raw_os_error(), Some(32 | 5)) && std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(e) if matches!(e.raw_os_error(), Some(32 | 5)) => {
+                let panes: Vec<String> = threads::session_view(ctx, project).map(|view| alive_panes(project, &view).into_iter().map(|(_, pane, _)| pane).collect()).unwrap_or_default();
+                let close = if panes.is_empty() { "close any shell, editor or agent working in it".to_string() } else { format!("close the project's panes (`herdr pane close {}`)", panes.join(" ")) };
+                return Err(e).with_context(|| format!("could not move {} to the trash: a process has it open; {close} and retry", project.dir().display()));
+            }
+            Err(e) => return Err(e).with_context(|| format!("could not move {} to the trash", project.dir().display())),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +203,7 @@ mod tests {
         let project = world.project("demo", "a.sock");
         world.thread(&project, world.home.path(), |t| t.branch = "hp/demo/t-0001-x".into());
         *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+        world.runner.on("pane close", crate::runner::fake::ok(r#"{"result":{}}"#));
         let ctx = world.ctx();
 
         let error = delete(&ctx, "demo", false).unwrap_err().to_string();
@@ -179,8 +217,10 @@ mod tests {
         assert!(trashed[0].file_name().to_string_lossy().starts_with("demo-"));
         assert!(trashed[0].path().join("PROJECT.md").is_file());
         assert!(trashed[0].path().join("threads/t-0001.toml").is_file());
-        // Nothing but herdr list calls ran: no worktree, branch or PR was touched.
-        assert!(world.runner.calls.borrow().iter().all(|c| c.display().contains(" list")));
+        // Windows closes the live panes first: a pane's shell keeps the folder in use.
+        assert_eq!(world.runner.count("pane close w1:p1"), usize::from(cfg!(windows)));
+        // Nothing else but herdr list calls ran: no worktree, branch or PR was touched.
+        assert!(world.runner.calls.borrow().iter().all(|c| c.display().contains(" list") || c.display().contains("pane close")));
         // `.trash` is not a project.
         assert!(crate::project::list_slugs(&world.root).is_empty());
     }
@@ -191,6 +231,34 @@ mod tests {
         let project = world.project("demo", "a.sock");
         delete(&world.ctx(), "demo", false).unwrap();
         assert!(!project.dir().exists());
+    }
+
+    /// A process whose current directory is in the project folder blocks the
+    /// move on Windows: one that lets go within the retry window does not
+    /// fail the delete; one that stays gets an actionable error.
+    #[cfg(windows)]
+    #[test]
+    fn windows_delete_waits_briefly_for_a_process_in_the_folder_then_explains() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        // One native process (no child of its own) with its directory in the folder.
+        let hold = |secs: u32| std::process::Command::new("ping").args(["-n", &(secs + 1).to_string(), "127.0.0.1"]).stdout(std::process::Stdio::null()).current_dir(project.dir()).spawn().unwrap();
+
+        let mut long = hold(8);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let start = std::time::Instant::now();
+        let error = format!("{:#}", delete(&world.ctx(), "demo", false).unwrap_err());
+        assert!(start.elapsed() >= std::time::Duration::from_secs(2), "no retry: {error}");
+        assert!(error.contains("a process has it open") && error.contains("retry"), "{error}");
+        assert!(project.dir().join("PROJECT.md").is_file());
+        let _ = long.kill();
+        let _ = long.wait();
+
+        let mut short = hold(1);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        delete(&world.ctx(), "demo", false).unwrap();
+        assert!(!project.dir().exists());
+        let _ = short.wait();
     }
 
     #[test]
