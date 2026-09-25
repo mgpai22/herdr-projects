@@ -148,11 +148,17 @@ impl std::fmt::Display for HerdrError {
 impl std::error::Error for HerdrError {}
 
 impl HerdrError {
-    /// True when herdr refused to launch this agent at all, so trying again
-    /// cannot help: the OMP profile is unknown there or invalid, the kind
-    /// takes no profile, or that herdr (server or CLI) predates `--profile`.
+    /// True when trying again cannot help: the OMP profile is unknown there
+    /// or invalid, the kind takes no profile, that herdr (server or CLI)
+    /// predates `--profile`, or the agent came up under another profile.
     pub fn launch_refused(&self) -> bool {
         matches!(self.code.as_str(), "unknown_launch_profile" | "invalid_launch_profile" | "agent_profile_requires_omp" | "agent_profile_unsupported" | "launch_profile_mismatch" | "usage")
+    }
+
+    /// herdr saw the wrong profile only after the agent started: that agent
+    /// keeps running in the pane, under its name, with the other profile.
+    pub fn agent_left_running(&self) -> bool {
+        self.code == "launch_profile_mismatch"
     }
 }
 
@@ -477,6 +483,11 @@ impl<'a> Herdr<'a> {
 
     pub fn agent_focus(&self, target: &str) -> Result<(), HerdrError> {
         self.call(&["agent", "focus", target], CALL_TIMEOUT).map(|_| ())
+    }
+
+    /// Closes a pane, and with it the agent running there.
+    pub fn pane_close(&self, pane: &str) -> Result<(), HerdrError> {
+        self.call(&["pane", "close", pane], CALL_TIMEOUT).map(|_| ())
     }
 
     /// Names an already detected agent (after Herdr's native resume leaves a

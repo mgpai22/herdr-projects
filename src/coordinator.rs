@@ -378,11 +378,25 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             }
         }
         Err(error) if error.launch_refused() => {
+            // A mismatch comes after the agent started: it would stay under
+            // the coordinator's name with another profile's credentials.
+            let pane = if !error.agent_left_running() {
+                format!("pane {} is not recorded as the coordinator", record.pane_id)
+            } else if let Err(close) = herdr.pane_close(&record.pane_id) {
+                format!("the agent herdr started is still running in pane {} ({close}); close that pane", record.pane_id)
+            } else {
+                format!("pane {} was closed, with the agent herdr started in it", record.pane_id)
+            };
             // Waiting cannot help: put back the coordinator this `open`
-            // replaced (its session stays resumable) and the files for it.
-            project.update_coordinator(|c| *c = original.clone().unwrap_or_default())?;
+            // replaced (its session stays resumable), or no record at all,
+            // and the files for it.
+            match &original {
+                Some(original) => project.update_coordinator(|c| *c = original.clone()).map(|_| ())?,
+                None => project.remove_coordinator()?,
+            }
             project::write_priming(&project, &prefix, ctx.env)?;
-            bail!("{error}. The previous coordinator record is kept; pane {} is not recorded as the coordinator", record.pane_id);
+            let kept = if original.is_some() { "The previous coordinator record is kept" } else { "No coordinator is recorded" };
+            bail!("{error}. {kept}; {pane}");
         }
         Err(error) => println!(
             "{kind} is not ready yet ({error}). If it shows a dialog, answer it in pane {}; it primes itself from AGENTS.md.",

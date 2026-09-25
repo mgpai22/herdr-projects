@@ -2236,6 +2236,8 @@ fn open_primes_for_the_profile_it_records_and_a_refused_profile_restores_the_rec
     world.runner.on("workspace get", ok(r#"{"result":{"workspace":{"label":"Demo"}}}"#));
     world.runner.on("--profile work", fail(1, r#"{"error":{"code":"unknown_launch_profile","message":"no omp launcher named work in [session.omp_launchers]"}}"#));
     world.runner.on("--profile old", fail(2, "unknown option: --profile\n"));
+    world.runner.on("--profile wrong", fail(1, r#"{"error":{"code":"launch_profile_mismatch","message":"requested omp profile wrong, but the agent reported default","agent":{"pane_id":"w3:p1","terminal_id":"term-1"}}}"#));
+    world.runner.on("pane close", ok(r#"{"result":{}}"#));
     world.runner.on("agent start", ok(r#"{"result":{"agent":{"pane_id":"w3:p1","tab_id":"w3:t1","workspace_id":"w3","name":"hpc-demo","agent":"omp","agent_status":"idle","agent_session":{"value":"sess-9"},"launch_profile":"neurable"}}}"#));
     let options = |profile: &str| crate::coordinator::OpenOptions {
         session: crate::paths::SessionFlags { session: None, socket: Some(socket.clone()) },
@@ -2248,6 +2250,11 @@ fn open_primes_for_the_profile_it_records_and_a_refused_profile_restores_the_rec
     };
     let ctx = world.ctx();
     let omp_config = || std::fs::read_to_string(project.dir().join(project::OMP_CONFIG)).unwrap();
+
+    // A refused first open leaves no record, as before it.
+    assert!(crate::coordinator::open(&ctx, "demo", &options("work")).is_err());
+    assert!(project.coordinator().is_none());
+    assert!(!project.state_dir().join("coordinator.json").exists());
 
     crate::coordinator::open(&ctx, "demo", &options("neurable")).unwrap();
     assert!(omp_config().contains("\"*gh *pr merge*\""), "{}", omp_config());
@@ -2262,7 +2269,17 @@ fn open_primes_for_the_profile_it_records_and_a_refused_profile_restores_the_rec
         assert_eq!((record.agent.as_str(), record.omp_profile.as_str(), record.agent_session.as_str()), ("omp", "neurable", "sess-9"), "{profile}");
         assert!(omp_config().contains("\"*gh *pr merge*\""), "{profile}");
     }
-    assert_eq!(start_calls(&world).len(), 3, "one start per open");
+    assert_eq!(world.runner.count("pane close"), 0, "nothing started, nothing to stop");
+
+    // herdr started the agent before it saw the other profile: its pane is closed.
+    let error = crate::coordinator::open(&ctx, "demo", &options("wrong")).unwrap_err().to_string();
+    assert!(error.contains("launch_profile_mismatch") && error.contains("pane w3:p1 was closed"), "{error}");
+    let record = project.coordinator().unwrap();
+    assert_eq!((record.omp_profile.as_str(), record.agent_session.as_str()), ("neurable", "sess-9"));
+    let closes: Vec<String> = world.runner.calls.borrow().iter().filter(|c| c.display().contains("pane close")).map(|c| c.display()).collect();
+    assert_eq!(closes.len(), 1, "{closes:?}");
+    assert!(closes[0].ends_with("pane close w3:p1"), "{closes:?}");
+    assert_eq!(start_calls(&world).len(), 5, "one start per open");
 }
 
 #[test]
@@ -2287,6 +2304,33 @@ fn a_thread_launch_refused_for_its_profile_fails_at_once_with_herdrs_reason() {
     assert!(t.error.contains("predates agent start --profile"), "{}", t.error);
     ticker::tick_project(&ctx, &project).unwrap();
     assert_eq!(world.runner.count("agent start"), 1);
+    assert_eq!(world.runner.count("pane close"), 0, "nothing started, nothing to stop");
+}
+
+#[test]
+fn a_thread_agent_started_under_another_profile_fails_and_its_pane_is_closed() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let cwd = world.home.path().join("wt");
+    std::fs::create_dir(&cwd).unwrap();
+    let wt = cwd.to_string_lossy().into_owned();
+    world.thread(&project, &cwd, |t| {
+        t.agent = "omp".into();
+        t.omp_profile = "neurable".into();
+        t.prompt_pending = true;
+    });
+    *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(&project), pane_json("w2", "w2:t1", "w2:p1", &wt));
+    world.runner.on("agent start", fail(1, r#"{"error":{"code":"launch_profile_mismatch","message":"requested omp profile neurable, but the agent reported default","agent":{"pane_id":"w2:p1","terminal_id":"term-2"}}}"#));
+    world.runner.on("pane close", ok(r#"{"result":{}}"#));
+    let ctx = world.ctx();
+
+    ticker::tick_project(&ctx, &project).unwrap();
+    let t = thread::load(&project, "t-0001").unwrap();
+    assert_eq!(t.status, Status::Failed);
+    assert!(t.error.contains("reported default") && t.error.contains("pane w2:p1 was closed"), "{}", t.error);
+    let closes: Vec<String> = world.runner.calls.borrow().iter().filter(|c| c.display().contains("pane close")).map(|c| c.display()).collect();
+    assert_eq!(closes.len(), 1, "{closes:?}");
+    assert!(closes[0].ends_with("pane close w2:p1"), "{closes:?}");
 }
 
 #[test]

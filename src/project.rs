@@ -338,6 +338,15 @@ impl Project {
         Ok(record)
     }
 
+    /// Removes `coordinator.json` under the lock: back to never opened.
+    pub fn remove_coordinator(&self) -> Result<()> {
+        let _lock = self.lock()?;
+        match std::fs::remove_file(self.state_dir().join("coordinator.json")) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        }
+    }
+
     pub fn safety(&self, config_dir: &Path) -> Result<Safety> {
         load_safety(config_dir, &self.canonical_dir())
     }
@@ -630,17 +639,23 @@ pub const PROFILE_PROBLEM: &str = "the coordinator's OMP profile";
 /// What `.omp/config.yml` should hold, and why the profile's rules are
 /// missing from it, if they are.
 fn wanted_omp_config(project: &Project, prefix: &str, env: &Env) -> (String, Option<String>) {
-    let set = format!("`set {} omp_profile <name>`", project.slug);
+    // A recorded OMP coordinator's profile wins over the setting, so while
+    // one is recorded only a coordinator started under another profile helps.
+    let other = if project.coordinator().is_some_and(|record| record.agent == "omp") {
+        format!("start the coordinator under another profile with `open {} --profile <name>`", project.slug)
+    } else {
+        format!("run `set {} omp_profile <name>` to use another profile", project.slug)
+    };
     let only_ours = ".omp/config.yml has only the herdr-projects rules";
     let profile = match coordinator_profile(project) {
         Ok(profile) => profile,
-        Err(error) => return (omp_config(prefix, "", None), Some(format!("{PROFILE_PROBLEM} is invalid ({error:#}); {only_ours}; run {set} with a valid name"))),
+        Err(error) => return (omp_config(prefix, "", None), Some(format!("{PROFILE_PROBLEM} is invalid ({error:#}); {only_ours}; {other}"))),
     };
     match crate::omp::bash_patterns(env, &profile) {
         Ok(rules) => (omp_config(prefix, &profile, Some(rules.as_slice())), None),
         Err(error) => {
             let path = crate::omp::config_path(env, &profile).map(|p| p.display().to_string()).unwrap_or_default();
-            (omp_config(prefix, "", None), Some(format!("{PROFILE_PROBLEM} config is not usable ({error:#}); {only_ours}; fix {path}, or run {set} to use another profile")))
+            (omp_config(prefix, "", None), Some(format!("{PROFILE_PROBLEM} config is not usable ({error:#}); {only_ours}; fix {path}, or {other}")))
         }
     }
 }
@@ -1089,6 +1104,15 @@ mod tests {
         assert_eq!(omp_approval(&config(), "gh pr merge 7").as_deref(), Some("deny"));
         assert!(mstack.is_file());
         assert!(priming_problems(&project, &prefix, &env).is_empty());
+
+        // Its config broken: the setting cannot help while the record wins, `open --profile` can.
+        let neurable = omp.join("profiles/neurable/agent/config.yml");
+        let good = std::fs::read(&neurable).unwrap();
+        std::fs::write(&neurable, b"\xff\xfe").unwrap();
+        let problems = priming_problems(&project, &prefix, &env);
+        assert!(problems.iter().any(|p| p.starts_with(PROFILE_PROBLEM) && p.ends_with("or start the coordinator under another profile with `open demo --profile <name>`")), "{problems:?}");
+        assert!(!problems.iter().any(|p| p.contains("omp_profile <name>")), "{problems:?}");
+        std::fs::write(&neurable, good).unwrap();
 
         // Another harness: back to the project setting, which has neither.
         project.update_coordinator(|c| c.agent = "claude".into()).unwrap();

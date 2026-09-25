@@ -632,13 +632,24 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
             }
             let mut args = safety.thread_agent_args.clone();
             args.extend(model);
-            match herdr.on_machine(&t.machine).agent_start(&t.agent_name, &t.agent, &t.omp_profile, &t.pane_id, &args) {
-                // Another attempt gets the same answer: fail now, with herdr's reason.
-                Err(error) if error.launch_refused() => thread::update(project, &t.id, |t| {
-                    t.status = thread::Status::Failed;
-                    t.error = error.to_string();
-                })
-                .map(|_| ()),
+            let herdr = herdr.on_machine(&t.machine);
+            match herdr.agent_start(&t.agent_name, &t.agent, &t.omp_profile, &t.pane_id, &args) {
+                // Another attempt gets the same answer: fail now, with herdr's
+                // reason. An agent left under another profile goes with its pane.
+                Err(error) if error.launch_refused() => {
+                    let reason = if !error.agent_left_running() {
+                        error.to_string()
+                    } else if let Err(close) = herdr.pane_close(&t.pane_id) {
+                        format!("{error}; the agent is still running in pane {} ({close}): close that pane", t.pane_id)
+                    } else {
+                        format!("{error}; its pane {} was closed", t.pane_id)
+                    };
+                    thread::update(project, &t.id, |t| {
+                        t.status = thread::Status::Failed;
+                        t.error = reason;
+                    })
+                    .map(|_| ())
+                }
                 other => other.map(|_| ()).map_err(Into::into),
             }
         })();
