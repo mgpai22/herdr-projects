@@ -102,3 +102,26 @@ fn configure_and_unconfigure_for_omp_touch_only_our_extension() {
     assert!(std::fs::symlink_metadata(agent.join("skills/autoproject")).is_err());
     assert_eq!(std::fs::read_to_string(extensions.join("other.ts")).unwrap(), "// someone else's\n");
 }
+
+#[test]
+fn configure_for_omp_from_a_named_profile_session_covers_every_profile() {
+    let home = tempfile::tempdir().unwrap();
+    let default = home.path().join(".omp/agent");
+    let neurable = home.path().join(".omp/profiles/neurable/agent");
+    std::fs::create_dir_all(&default).unwrap();
+    std::fs::create_dir_all(&neurable).unwrap();
+    let root = home.path().join("root");
+    // What an OMP session under `--profile neurable` exports to its children.
+    let omp = |args: &[&str]| Command::new(BIN).env_clear().env("HOME", home.path()).env("OMP_PROFILE", "neurable").env("PI_CODING_AGENT_DIR", &neurable).arg("--root").arg(&root).args(args).output().unwrap();
+
+    let out = omp(&["configure", "--clients", "omp", "--hooks-only"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    for dir in [&default, &neurable] {
+        assert!(dir.join("extensions/herdr-projects.ts").is_file(), "{}", dir.display());
+    }
+    let out = omp(&["unconfigure"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    for dir in [&default, &neurable] {
+        assert!(!dir.join("extensions/herdr-projects.ts").exists(), "{}", dir.display());
+    }
+}

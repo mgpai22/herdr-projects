@@ -65,6 +65,9 @@ enum Command {
         /// Herdr agent kind for the coordinator (default: coordinator_agent in PROJECT.md)
         #[arg(long, value_name = "KIND")]
         agent: Option<String>,
+        /// OMP profile for an omp coordinator; herdr runs its launcher from [session.omp_launchers] (default: omp_profile in PROJECT.md; empty: that)
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
         /// A model flag for the agent CLI, repeatable (--agent-arg --model --agent-arg NAME); nothing else is accepted
         #[arg(long = "agent-arg", value_name = "ARG", allow_hyphen_values = true)]
         agent_args: Vec<String>,
@@ -319,6 +322,9 @@ enum ThreadCommand {
         /// Herdr agent kind (default: thread_agent in PROJECT.md)
         #[arg(long, value_name = "KIND")]
         agent: Option<String>,
+        /// OMP profile for an omp thread, from herdr's [session.omp_launchers] (default: omp_profile in PROJECT.md)
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
         /// Placement: worktree (default with --repo), tab (default without), or checkout (a tab on the repo's main checkout)
         #[arg(long, value_name = "worktree|tab|checkout")]
         kind: Option<String>,
@@ -338,6 +344,9 @@ enum ThreadCommand {
         /// Restart with another Herdr agent kind
         #[arg(long, value_name = "KIND")]
         agent: Option<String>,
+        /// Restart with another OMP profile; an empty value goes back to omp_profile in PROJECT.md
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
         /// Replace the model flag (repeatable, model flags only; none given keeps the old ones, unless the kind changes)
         #[arg(long = "agent-arg", value_name = "ARG", allow_hyphen_values = true)]
         agent_args: Vec<String>,
@@ -473,7 +482,7 @@ pub fn run() -> Result<()> {
             let repos = repos.iter().map(|arg| project::parse_repo_arg(arg)).collect();
             let project = project::create(&ctx.root, &name, &goal, repos)?;
             let prefix = coordinator::current_prefix(&ctx.root)?;
-            project::write_priming(&project, &prefix)?;
+            project::write_priming(&project, &prefix, ctx.env)?;
             println!("created `{}` at {}", project.slug, project.dir().display());
             println!("next: {prefix} open {}", project.slug);
             Ok(())
@@ -494,13 +503,14 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }
-        Command::Open { slug, agent, agent_args, new, tab, rebind, session } => coordinator::open(
+        Command::Open { slug, agent, profile, agent_args, new, tab, rebind, session } => coordinator::open(
             &ctx,
             &slug,
             &OpenOptions {
                 session: session.into(),
                 rebind,
                 agent,
+                profile,
                 agent_args,
                 new,
                 // Only a person at a terminal gets the agent in place; the
@@ -527,16 +537,16 @@ pub fn run() -> Result<()> {
             }
         },
         Command::Thread { command } => match command {
-            ThreadCommand::Start { slug, title, repo, machine, agent, kind, agent_args, base, task_file } => {
+            ThreadCommand::Start { slug, title, repo, machine, agent, profile, kind, agent_args, base, task_file } => {
                 let task = read_text(&task_file)?;
                 let kind = kind.as_deref().map(crate::thread::Kind::parse).transpose()?;
-                let thread = threads::start(&ctx, &slug, StartArgs { title, repo, machine, agent, kind, agent_args, base, task })?;
+                let thread = threads::start(&ctx, &slug, StartArgs { title, repo, machine, agent, profile, kind, agent_args, base, task })?;
                 println!("{}", serde_json::json!({ "id": thread.id, "kind": thread.kind, "agent": thread.agent, "branch": thread.branch, "pane_id": thread.pane_id }));
                 Ok(())
             }
-            ThreadCommand::Restart { slug, id, agent, agent_args } => {
+            ThreadCommand::Restart { slug, id, agent, profile, agent_args } => {
                 let args = (!agent_args.is_empty()).then_some(agent_args);
-                let thread = threads::restart(&ctx, &slug, &id, agent.as_deref(), args)?;
+                let thread = threads::restart(&ctx, &slug, &id, agent.as_deref(), profile.as_deref(), args)?;
                 println!("{} is back in pane {}; the ticker launches its {} agent", thread.id, thread.pane_id, thread.agent);
                 Ok(())
             }

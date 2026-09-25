@@ -10,6 +10,7 @@ mod inbox;
 mod lifecycle;
 mod names;
 mod notify;
+mod omp;
 mod overview;
 mod paths;
 mod popup;

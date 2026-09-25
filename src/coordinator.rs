@@ -84,6 +84,7 @@ pub fn found(project: &Project, socket: &str, session: &str, agents: &[Agent]) -
         agent_name: agent.name.clone(),
         cwd,
         agent: agent.agent.clone(),
+        omp_profile: agent.omp_profile(),
         agent_session: agent.session_id().to_string(),
         updated: String::new(),
     })
@@ -103,6 +104,8 @@ pub struct LivePane {
     /// When the ticker first observed the current `(agent_status, state_change_seq)` pair.
     pub pair_since: String,
     pub agent_session: String,
+    /// See `Agent::omp_profile`.
+    pub omp_profile: String,
 }
 
 pub fn live(project: &Project) -> Vec<LivePane> {
@@ -127,6 +130,7 @@ pub fn discover(record: &Coordinator, previous: &[LivePane], agents: &[Agent], n
                 state_change_seq: a.state_change_seq,
                 pair_since: same.map(|p| p.pair_since.clone()).unwrap_or_else(|| now.to_string()),
                 agent_session: a.session_id().to_string(),
+                omp_profile: a.omp_profile(),
             }
         })
         .collect()
@@ -153,20 +157,23 @@ pub struct OpenOptions {
     pub rebind: bool,
     /// Herdr agent kind; default `coordinator_agent` in PROJECT.md.
     pub agent: Option<String>,
+    /// OMP profile; default `omp_profile` in PROJECT.md, empty given: that too.
+    pub profile: Option<String>,
     /// Extra agent CLI arguments (a model flag, for example).
     pub agent_args: Vec<String>,
     /// Start another coordinator although one is running.
     pub new: bool,
     /// Start the agent in the pane this command runs in, when that is a shell
     /// pane of the session (false: a new tab, as the popup and actions do).
+    /// A named OMP profile always starts in a tab: only herdr knows its launcher.
     pub here: bool,
 }
 
 /// The pane `open` runs in, when the coordinator can start right there: the
 /// command runs in a Herdr pane of this session that no agent occupies, and
 /// not in a plugin pane or action (the popup must never become the coordinator).
-fn here_pane(ctx: &Ctx, options: &OpenOptions, socket: &str, agents: &[Agent]) -> Option<String> {
-    if !options.here || ctx.env.var("HERDR_PLUGIN_STATE_DIR").is_some() || ctx.env.var("HERDR_SOCKET_PATH") != Some(socket) {
+fn here_pane(ctx: &Ctx, options: &OpenOptions, socket: &str, agents: &[Agent], profile: &str) -> Option<String> {
+    if !options.here || !profile.is_empty() || ctx.env.var("HERDR_PLUGIN_STATE_DIR").is_some() || ctx.env.var("HERDR_SOCKET_PATH") != Some(socket) {
         return None;
     }
     let pane = ctx.env.var("HERDR_PANE_ID")?;
@@ -191,12 +198,13 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     }
     // An agent can run `open` too: it may pick a model, never widen powers.
     crate::settings::require_model_args(ctx, &project, &kind, &options.agent_args)?;
+    let profile = crate::settings::launch_profile(&kind, options.profile.as_deref(), &settings.omp_profile, &settings.omp_profile)?;
     let safety = project.safety(&ctx.config_dir)?;
     let session = paths::resolve_session(&options.session, ctx.env, ctx.runner)?;
     let socket = session.socket.to_string_lossy().into_owned();
     let prefix = current_prefix(&ctx.root)?;
     // The priming files are what make an agent in this folder the coordinator.
-    project::write_priming(&project, &prefix)?;
+    project::write_priming(&project, &prefix, ctx.env)?;
 
     // A project belongs to the session it was opened in.
     let mut previous = project.coordinator();
@@ -231,9 +239,13 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let cwd = dir.to_string_lossy().into_owned();
 
     // A coordinator is running: focus the most recently active one.
-    // With an explicit kind, only a running coordinator of that kind is reused:
-    // choosing another kind in the popup starts one beside the others.
-    let running: Vec<&Agent> = agents.iter().filter(|a| a.works_in(&cwd) && options.agent.as_ref().is_none_or(|k| &a.agent == k)).collect();
+    // With an explicit kind or profile, only a running coordinator of that
+    // kind and profile is reused: choosing another in the popup starts one
+    // beside the others.
+    let running: Vec<&Agent> = agents
+        .iter()
+        .filter(|a| a.works_in(&cwd) && options.agent.as_ref().is_none_or(|k| &a.agent == k) && (options.profile.is_none() || a.omp_profile() == profile))
+        .collect();
     if let Some(agent) = running.iter().max_by_key(|a| a.state_change_seq)
         && !options.new
     {
@@ -251,6 +263,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             c.agent_name = agent.name.clone();
             c.cwd = cwd.clone();
             c.agent = agent.agent.clone();
+            c.omp_profile = agent.omp_profile();
             if !agent.session_id().is_empty() {
                 c.agent_session = agent.session_id().to_string();
             }
@@ -266,7 +279,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     // when it is still there at a shell prompt, else add a tab to the
     // project's workspace, else make the workspace.
     let panes = herdr.pane_list()?;
-    let here = here_pane(ctx, options, &socket, &agents);
+    let here = here_pane(ctx, options, &socket, &agents, &profile);
     let reusable = previous.as_ref().filter(|record| {
         !options.new && panes.iter().any(|p| pane_matches(record, p)) && !agents.iter().any(|a| a.pane_id == record.pane_id)
     });
@@ -304,9 +317,10 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let name = names::free_coordinator(slug, &taken);
     // With --new the recorded session belongs to a coordinator that stays
     // running: the new agent starts fresh and never inherits its session id.
+    // Another OMP profile has its own sessions: that starts fresh too.
     let resume = previous
         .as_ref()
-        .filter(|r| !options.new && r.agent == kind && !r.agent_session.is_empty())
+        .filter(|r| !options.new && r.agent == kind && r.omp_profile == profile && !r.agent_session.is_empty())
         .and_then(|r| crate::agents::resume_args(&kind, &r.agent_session))
         .unwrap_or_default();
     let record = project.update_coordinator(|c| {
@@ -319,6 +333,7 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             agent_name: name.clone(),
             cwd: cwd.clone(),
             agent: kind.clone(),
+            omp_profile: profile.clone(),
             // Kept only for the resume; the ticker records a fresh agent's own.
             agent_session: if resume.is_empty() { String::new() } else { previous.as_ref().map(|r| r.agent_session.clone()).unwrap_or_default() },
             updated: String::new(),
@@ -334,14 +349,14 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         ticker::start(ctx)?;
         return run_here(ctx, &herdr, &project, &record, &args, &base_args, &prefix);
     }
-    let mut started = start_when_shell_ready(&herdr, &name, &kind, &record.pane_id, &args);
+    let mut started = start_when_shell_ready(&herdr, &name, &kind, &profile, &record.pane_id, &args);
     if let Err(error) = &started
         && !resume.is_empty()
         && error.code != "agent_not_ready"
     {
         // The recorded session may be gone: start fresh once.
         println!("resuming session {} failed ({error}); starting a fresh {kind}", record.agent_session);
-        started = herdr.agent_start(&name, &kind, &record.pane_id, &base_args);
+        started = herdr.agent_start(&name, &kind, &profile, &record.pane_id, &base_args);
     }
     match started {
         Ok(agent) => {
@@ -427,10 +442,10 @@ fn adopt_here(herdr: &Herdr, project: &Project, record: &Coordinator) -> bool {
 
 /// A pane that was just created is not an available shell for a moment
 /// (`agent_pane_busy` while its shell starts): retry for a few seconds.
-fn start_when_shell_ready(herdr: &Herdr, name: &str, kind: &str, pane: &str, args: &[String]) -> Result<Agent, crate::herdr::HerdrError> {
+fn start_when_shell_ready(herdr: &Herdr, name: &str, kind: &str, profile: &str, pane: &str, args: &[String]) -> Result<Agent, crate::herdr::HerdrError> {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        match herdr.agent_start(name, kind, pane, args) {
+        match herdr.agent_start(name, kind, profile, pane, args) {
             Err(error) if error.code == "agent_pane_busy" && std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(500));
             }

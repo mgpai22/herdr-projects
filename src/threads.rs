@@ -74,6 +74,8 @@ pub struct StartArgs {
     pub machine: Option<String>,
     /// Herdr agent kind (`--agent`), default `thread_agent` in PROJECT.md.
     pub agent: Option<String>,
+    /// OMP profile (`--profile`), default `omp_profile` in PROJECT.md.
+    pub profile: Option<String>,
     /// Placement (`--kind worktree|tab|checkout`); default worktree with a
     /// repo, tab without one.
     pub kind: Option<Kind>,
@@ -110,6 +112,12 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         bail!("the task is empty");
     }
     let (settings, _) = project.read_project_md()?;
+    let agent_kind = args.agent.clone().unwrap_or_else(|| settings.thread_agent.clone());
+    if !crate::agents::is_kind(&agent_kind) {
+        bail!("`{agent_kind}` is not a Herdr agent kind; `herdr agent start --help` lists them");
+    }
+    crate::settings::require_model_args(ctx, &project, &agent_kind, &args.agent_args)?;
+    let profile = crate::settings::launch_profile(&agent_kind, args.profile.as_deref(), &settings.omp_profile, &settings.omp_profile)?;
     // Without a running ticker nothing launches.
     ticker::start(ctx)?;
     let view = require_session(ctx, &project)?;
@@ -144,11 +152,6 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         );
     }
 
-    let agent_kind = args.agent.clone().unwrap_or_else(|| settings.thread_agent.clone());
-    if !crate::agents::is_kind(&agent_kind) {
-        bail!("`{agent_kind}` is not a Herdr agent kind; `herdr agent start --help` lists them");
-    }
-    crate::settings::require_model_args(ctx, &project, &agent_kind, &args.agent_args)?;
     let kind = placement(args.kind, !repo.is_empty(), !machine.is_empty())?;
     let record = thread::allocate(&project, |t| {
         t.title = args.title.trim().to_string();
@@ -156,6 +159,7 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         t.repo = repo.clone();
         t.machine = machine.clone();
         t.agent = agent_kind.clone();
+        t.omp_profile = profile.clone();
         t.agent_args = args.agent_args.clone();
         t.base = args.base.clone().unwrap_or_default();
     })?;
@@ -421,34 +425,36 @@ fn lists_for(view: &SessionView, record: &Thread) -> Result<(Vec<Agent>, Vec<Pan
     Ok((herdr.agent_list().map_err(unreachable)?, herdr.pane_list().map_err(unreachable)?))
 }
 
-/// `thread restart [--agent KIND]`: brings a thread back in its pane, worktree
-/// or a new tab, with the same or another harness.
-pub fn restart(ctx: &Ctx, slug: &str, id: &str, agent: Option<&str>, agent_args: Option<Vec<String>>) -> Result<Thread> {
+/// `thread restart [--agent KIND] [--profile NAME]`: brings a thread back in
+/// its pane, worktree or a new tab, with the same or another harness.
+pub fn restart(ctx: &Ctx, slug: &str, id: &str, agent: Option<&str>, profile: Option<&str>, agent_args: Option<Vec<String>>) -> Result<Thread> {
     let project = Project::load(&ctx.root, slug)?;
     if let Some(kind) = agent
         && !crate::agents::is_kind(kind)
     {
         bail!("`{kind}` is not a Herdr agent kind; `herdr agent start --help` lists them");
     }
+    let current = thread::load(&project, id)?;
+    let kind = agent.unwrap_or(&current.agent).to_string();
     if let Some(args) = &agent_args {
-        let kind = match agent {
-            Some(kind) => kind.to_string(),
-            None => thread::load(&project, id)?.agent,
-        };
         crate::settings::require_model_args(ctx, &project, &kind, args)?;
     }
-    if let Some(kind) = agent {
+    // The record's profile, unless the thread was not OMP before: then the
+    // project's. Model flags are kind-scoped, so a profile change keeps them.
+    let (settings, _) = project.read_project_md()?;
+    let fallback = if current.agent == "omp" { &current.omp_profile } else { &settings.omp_profile };
+    let profile = crate::settings::launch_profile(&kind, profile, fallback, &settings.omp_profile)?;
+    thread::update(&project, id, |t| {
         // Another harness: the old arguments (a model flag) no longer apply.
-        thread::update(&project, id, |t| {
-            if t.agent != kind {
-                t.agent_args.clear();
-            }
-            t.agent = kind.to_string();
-        })?;
-    }
-    if let Some(args) = agent_args {
-        thread::update(&project, id, |t| t.agent_args = args)?;
-    }
+        if t.agent != kind {
+            t.agent_args.clear();
+        }
+        t.agent = kind.clone();
+        t.omp_profile = profile.clone();
+        if let Some(args) = agent_args {
+            t.agent_args = args;
+        }
+    })?;
     let record = thread::load(&project, id)?;
     ticker::start(ctx)?;
     let view = require_session(ctx, &project)?;

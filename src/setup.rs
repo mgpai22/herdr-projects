@@ -194,23 +194,24 @@ pub fn hook_file(env: &Env, agent: &str, claude_home: Option<&Path>, codex_home:
     }
 }
 
-/// OMP's agent directory: `PI_CODING_AGENT_DIR`, else `~/.omp/agent`. Named
-/// profiles (`~/.omp/profiles/<name>/agent`) are not supported. A relative
-/// value is resolved against the cwd, as OMP does, so the journal key names
-/// the file that was written, whatever the cwd of a later `unconfigure`.
-pub fn omp_agent_dir(env: &Env) -> PathBuf {
-    match env.var("PI_CODING_AGENT_DIR") {
-        Some(dir) => std::path::absolute(dir).unwrap_or_else(|_| PathBuf::from(dir)),
-        None => env.home.join(".omp/agent"),
+/// Whether a harness is installed: its config directory exists (for OMP, any
+/// profile's agent directory).
+pub fn installed(env: &Env, agent: &str, claude_home: Option<&Path>, codex_home: Option<&Path>) -> bool {
+    match agent {
+        "omp" => !crate::omp::profile_agent_dirs(env).is_empty(),
+        _ => hook_file(env, agent, claude_home, codex_home).parent().is_some_and(Path::is_dir),
     }
 }
 
-/// Whether a harness is installed: its config directory exists.
-pub fn installed(env: &Env, agent: &str, claude_home: Option<&Path>, codex_home: Option<&Path>) -> bool {
-    match agent {
-        "omp" => omp_agent_dir(env).is_dir(),
-        _ => hook_file(env, agent, claude_home, codex_home).parent().is_some_and(Path::is_dir),
+/// The OMP agent dirs `configure` writes to for these clients: `omp` means
+/// every profile, `omp:<profile>` one (`omp:` the default; `doctor --fix`).
+/// With no profile agent dir at all, the default one, which `configure` creates.
+fn omp_agent_dirs(env: &Env, clients: &[String]) -> Vec<PathBuf> {
+    let mut dirs = crate::omp::profile_agent_dirs(env);
+    if dirs.is_empty() {
+        dirs.push((String::new(), crate::omp::agent_dir(env, "")));
     }
+    dirs.into_iter().filter(|(name, _)| clients.iter().any(|c| c == "omp" || c.strip_prefix("omp:") == Some(name.as_str()))).map(|(_, dir)| dir).collect()
 }
 
 /// Bump together with line 1 of `assets/omp/herdr-projects.ts`.
@@ -219,10 +220,10 @@ const OMP_EXTENSION: &str = include_str!("../assets/omp/herdr-projects.ts");
 /// Line 1 of every copy this plugin wrote, of any version.
 const OMP_HEADER: &str = "// HERDR_PROJECTS_OMP_VERSION=";
 
-/// OMP discovers extensions in `<agent dir>/extensions`. OMP has no hook
-/// file: this extension stands in for the hooks.
-pub fn omp_extension_path(env: &Env) -> PathBuf {
-    omp_agent_dir(env).join("extensions/herdr-projects.ts")
+/// OMP discovers extensions in `<agent dir>/extensions`, per profile. OMP has
+/// no hook file: this extension stands in for the hooks.
+pub fn omp_extension_path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("extensions/herdr-projects.ts")
 }
 
 /// The bundled extension with the binary and root filled in as JSON strings,
@@ -262,7 +263,7 @@ pub fn omp_extension_root(text: &str) -> Option<String> {
 }
 
 /// Whether OMP already loads the bundled skill through `~/.agents/skills`
-/// (the Codex link): a second link would list it twice.
+/// (the Codex link), which every OMP profile reads: a second link would list it twice.
 pub fn omp_sees_shared_skill(env: &Env, source: &Path) -> bool {
     let shared = std::fs::canonicalize(env.home.join(".agents/skills").join(SKILL));
     shared.is_ok_and(|shared| std::fs::canonicalize(source).is_ok_and(|source| source == shared))
@@ -278,10 +279,8 @@ pub fn skill_source() -> Option<PathBuf> {
 }
 
 /// Where a harness looks for user skills: Claude Code's `<config dir>/skills`,
-/// OMP's `<agent dir>/skills`, Codex's user scope `~/.agents/skills` (not
-/// under `CODEX_HOME`). A skills directory that is itself a link is resolved,
-/// so a shared directory gets one link and one journal key; a missing one is
-/// resolved through its parent, so the key stays the same once it exists.
+/// Codex's user scope `~/.agents/skills` (not under `CODEX_HOME`); OMP's is
+/// `omp_skill_link`.
 pub fn skill_link(env: &Env, agent: &str, claude_home: Option<&Path>) -> PathBuf {
     let dir = match agent {
         "claude" => claude_home
@@ -289,9 +288,20 @@ pub fn skill_link(env: &Env, agent: &str, claude_home: Option<&Path>) -> PathBuf
             .or_else(|| env.var("CLAUDE_CONFIG_DIR").map(PathBuf::from))
             .unwrap_or_else(|| env.home.join(".claude"))
             .join("skills"),
-        "omp" => omp_agent_dir(env).join("skills"),
         _ => env.home.join(".agents/skills"),
     };
+    link_in(dir)
+}
+
+/// OMP's `<agent dir>/skills`, per profile.
+pub fn omp_skill_link(agent_dir: &Path) -> PathBuf {
+    link_in(agent_dir.join("skills"))
+}
+
+/// The skill link in a skills directory. One that is itself a link is
+/// resolved, so a shared directory gets one link and one journal key; a
+/// missing one is resolved through its parent, so the key stays the same once it exists.
+fn link_in(dir: PathBuf) -> PathBuf {
     let resolved = std::fs::canonicalize(&dir).or_else(|_| std::fs::canonicalize(dir.parent().unwrap_or(&dir)).map(|p| p.join("skills")));
     resolved.unwrap_or(dir).join(SKILL)
 }
@@ -322,8 +332,9 @@ pub fn skill_state(link: &Path, source: &Path) -> SkillState {
 }
 
 pub struct ConfigureOptions {
-    /// `claude`, `codex`, `omp`, or any mix; empty means every harness whose
-    /// config directory exists.
+    /// `claude`, `codex`, `omp` (every OMP profile), or any mix; empty means
+    /// every harness whose config directory exists. `omp:<profile>` (`omp:`
+    /// for the default) limits OMP to one profile, for `doctor --fix`.
     pub clients: Vec<String>,
     pub claude_home: Option<PathBuf>,
     pub codex_home: Option<PathBuf>,
@@ -377,30 +388,31 @@ pub fn configure(ctx: &Ctx, options: &ConfigureOptions) -> Result<Vec<String>> {
         notes.push(format!("{}: {} hook entries for `{command}`", file.display(), if before.is_some() { "adding" } else { "creating with" }));
         edits.push((file, Owned { before, after, kind: "hooks".into(), command: Some(command) }));
     }
-    if options.hooks && clients.iter().any(|c| c == "omp") {
-        let file = omp_extension_path(ctx.env);
-        let after = render_omp_extension(&binary, &ctx.root);
-        match omp_extension_state(&file, &after)? {
-            ExtensionState::Current => notes.push(format!("{}: OMP extension already in place", file.display())),
-            ExtensionState::Missing => {
-                notes.push(format!("{}: installing the OMP extension (v{OMP_EXTENSION_VERSION})", file.display()));
-                edits.push((file, Owned { before: None, after, kind: "omp-extension".into(), command: None }));
+    if options.hooks {
+        for dir in omp_agent_dirs(ctx.env, &clients) {
+            let file = omp_extension_path(&dir);
+            let after = render_omp_extension(&binary, &ctx.root);
+            match omp_extension_state(&file, &after)? {
+                ExtensionState::Current => notes.push(format!("{}: OMP extension already in place", file.display())),
+                ExtensionState::Missing => {
+                    notes.push(format!("{}: installing the OMP extension (v{OMP_EXTENSION_VERSION})", file.display()));
+                    edits.push((file, Owned { before: None, after, kind: "omp-extension".into(), command: None }));
+                }
+                ExtensionState::Stale => {
+                    notes.push(format!("{}: rewriting the OMP extension (v{OMP_EXTENSION_VERSION}, this binary and root)", file.display()));
+                    edits.push((file.clone(), Owned { before: read(&file)?, after, kind: "omp-extension".into(), command: None }));
+                }
+                ExtensionState::Foreign => notes.push(format!("{}: left alone, it is not this plugin's file; move it away and run `configure` again to install the OMP extension", file.display())),
             }
-            ExtensionState::Stale => {
-                notes.push(format!("{}: rewriting the OMP extension (v{OMP_EXTENSION_VERSION}, this binary and root)", file.display()));
-                edits.push((file.clone(), Owned { before: read(&file)?, after, kind: "omp-extension".into(), command: None }));
-            }
-            ExtensionState::Foreign => notes.push(format!("{}: left alone, it is not this plugin's file; move it away and run `configure` again to install the OMP extension", file.display())),
         }
     }
     let mut links: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
     if let Some(source) = &options.skill {
         let mut seen = Vec::new();
+        let mut targets: Vec<(bool, PathBuf)> = clients.iter().filter(|c| matches!(c.as_str(), "claude" | "codex")).map(|c| (false, skill_link(ctx.env, c, options.claude_home.as_deref()))).collect();
         // OMP last, so a Codex link made in this run counts as already there.
-        let mut skill_clients: Vec<&String> = clients.iter().filter(|c| matches!(c.as_str(), "claude" | "codex" | "omp")).collect();
-        skill_clients.sort_by_key(|c| c.as_str() == "omp");
-        for client in skill_clients {
-            let link = skill_link(ctx.env, client, options.claude_home.as_deref());
+        targets.extend(omp_agent_dirs(ctx.env, &clients).iter().map(|dir| (true, omp_skill_link(dir))));
+        for (omp, link) in targets {
             if seen.contains(&link) {
                 continue;
             }
@@ -409,7 +421,7 @@ pub fn configure(ctx: &Ctx, options: &ConfigureOptions) -> Result<Vec<String>> {
                 notes.push(format!("{}: no bundled skill at {}; not linked", link.display(), source.display()));
                 break;
             }
-            if client == "omp" && (omp_sees_shared_skill(ctx.env, source) || links.iter().any(|(l, s)| s.is_some() && *l == skill_link(ctx.env, "codex", None))) {
+            if omp && (omp_sees_shared_skill(ctx.env, source) || links.iter().any(|(l, s)| s.is_some() && *l == skill_link(ctx.env, "codex", None))) {
                 notes.push(format!("{}: not linked, OMP already loads the `{SKILL}` skill through ~/.agents/skills", link.display()));
                 continue;
             }
@@ -856,13 +868,6 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_omp_agent_dir_resolves_against_the_cwd() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[("PI_CODING_AGENT_DIR", "omp-agent")]);
-        assert_eq!(omp_agent_dir(&env), std::env::current_dir().unwrap().join("omp-agent"));
-    }
-
-    #[test]
     fn the_root_a_copy_was_rendered_for_is_read_back() {
         let root = Path::new("/r/with \"quote\"");
         let rendered = render_omp_extension(Path::new("/bin/hp"), root);
@@ -882,7 +887,7 @@ mod tests {
         let runner = crate::runner::fake::FakeRunner::new();
         let ctx = Ctx { env: &env, root: home.path().join("root"), config_dir: home.path().join("cfg"), runner: &runner, detached_ticker: false };
         let options = |clients: &[&str]| ConfigureOptions { clients: clients.iter().map(|c| c.to_string()).collect(), claude_home: None, codex_home: None, dry_run: false, hooks: false, sidebar: false, key: None, herdr_config: None, skill: Some(source.clone()) };
-        let omp_link = skill_link(&env, "omp", None);
+        let omp_link = omp_skill_link(&agent);
 
         configure(&ctx, &options(&["omp"])).unwrap();
         assert_eq!(skill_state(&omp_link, &source), SkillState::Ours);
@@ -896,5 +901,43 @@ mod tests {
         // A later OMP-only run sees the shared link.
         configure(&ctx, &options(&["omp"])).unwrap();
         assert_eq!(skill_state(&omp_link, &source), SkillState::Missing);
+    }
+
+    #[test]
+    fn configure_installs_into_every_omp_profile_or_one_and_unconfigure_removes_them_all() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        let custom = h.join("omp-agent");
+        let neurable = h.join(".omp/profiles/neurable/agent");
+        for dir in [&custom, &neurable, &h.join(".omp/agent"), &h.join(".omp/profiles/Bad/agent")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        // PI_CODING_AGENT_DIR moves the default profile only.
+        let env = Env::for_test(h, &[("PI_CODING_AGENT_DIR", custom.to_str().unwrap())]);
+        let source = h.join("plugin/skill/autoproject");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("SKILL.md"), "---\nname: autoproject\n---\n").unwrap();
+        let runner = crate::runner::fake::FakeRunner::new();
+        let ctx = Ctx { env: &env, root: h.join("root"), config_dir: h.join("cfg"), runner: &runner, detached_ticker: false };
+        let options = |clients: &[&str]| ConfigureOptions { clients: clients.iter().map(|c| c.to_string()).collect(), claude_home: Some(h.join("claude")), codex_home: Some(h.join("codex")), dry_run: false, hooks: true, sidebar: false, key: None, herdr_config: None, skill: Some(source.clone()) };
+        let installed_in = |dir: &Path| omp_extension_path(dir).is_file() && skill_state(&omp_skill_link(dir), &source) == SkillState::Ours;
+
+        // One profile (`doctor --fix`): only its files.
+        configure(&ctx, &options(&["omp:neurable"])).unwrap();
+        assert!(installed_in(&neurable) && !installed_in(&custom));
+        configure(&ctx, &options(&["omp:"])).unwrap();
+        assert!(installed_in(&custom));
+        unconfigure(&ctx).unwrap();
+        assert!(!installed_in(&neurable) && !installed_in(&custom));
+
+        // Auto-detected: every valid profile, one journal key per file.
+        configure(&ctx, &options(&[])).unwrap();
+        assert!(installed_in(&custom) && installed_in(&neurable));
+        assert!(!omp_extension_path(&h.join(".omp/agent")).exists(), "the overridden default dir");
+        assert!(!omp_extension_path(&h.join(".omp/profiles/Bad/agent")).exists(), "an invalid profile name");
+        assert_eq!(load_journal(&ctx.config_dir).len(), 4);
+        unconfigure(&ctx).unwrap();
+        assert!(!omp_extension_path(&neurable).exists() && !omp_skill_link(&neurable).is_symlink());
+        assert!(!omp_extension_path(&custom).exists());
     }
 }

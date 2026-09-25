@@ -32,6 +32,7 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
   library/<id>/           home copy of files a thread produced
   .state/                 status, coordinator record, live coordinators, ticker state, lock
   .omp/config.yml         an OMP coordinator's approval rules; written by the binary (see OMP)
+  .mstack/config.yml      turns mstack mode on for an OMP coordinator with mstack 0.4.0+ (see OMP)
 ~/.herdr-projects/.ticker.lock  .ticker.log  .progress/  .channel/  .trash/
 ~/.config/herdr-projects/config.toml             yours: root, safety tables, machines
 ~/.config/herdr-projects/owned.json              what `configure` changed, for `unconfigure`
@@ -40,7 +41,7 @@ How Herdr Projects works, what it writes where, what its safety settings do and 
 
 Every thread works from `<its working directory>/.herdr-project/<project>-<id>/`: `brief.md` (written by the binary), `report.md` and `library/` (written by the agent). In a git repository that folder is in `info/exclude`, so nothing in it is committed. Git therefore treats it as clean and removing a worktree deletes it, which is why a resolve keeps the worktree when the final copy home was partial.
 
-`PROJECT.md` settings, all changeable from the popup's settings section, from chat, or with `herdr-projects set <project> <key> <value>`: `name` (the workspace label), `goal`, `repos` (`repos.add PATH[@MACHINE]`, `repos.remove PATH`), `coordinator_agent` and `thread_agent` (the default Herdr agent kinds), `max_parallel_threads` (3), `auto_resolve_days` (7), `nudge` (`true`), `mute` (`false`).
+`PROJECT.md` settings, all changeable from the popup's settings section, from chat, or with `herdr-projects set <project> <key> <value>`: `name` (the workspace label), `goal`, `repos` (`repos.add PATH[@MACHINE]`, `repos.remove PATH`), `coordinator_agent` and `thread_agent` (the default Herdr agent kinds), `omp_profile` (the OMP profile for OMP coordinators and threads; empty = default, see OMP), `max_parallel_threads` (3), `auto_resolve_days` (7), `nudge` (`true`), `mute` (`false`).
 
 ## Commands
 
@@ -147,7 +148,7 @@ A file `routines/<name>.md` with TOML front matter; the body is the prompt.
 
 - `schedule = "every <N>m|h|d"` or `"daily HH:MM"` (local time): the coordinator gets the body as an inbox item when it is due; while that item is unhandled, later runs add none. With no coordinator running (any agent in the project folder counts), a due run does nothing, runs no command and is not made up later; `routine list`, the popup and `doctor` show it as `skipped: no coordinator`. `routine list` shows each routine's last and next run. An optional `command` runs (`sh -c`, in the project folder, 60 second timeout) only when `routine_commands = true` and you have run `herdr-projects routine approve <project> <name>` in a terminal; its output reaches the coordinator capped at 4,000 characters inside a fence labelled as untrusted.
 - `on = "pr"`, optionally `events = ["opened", "checks-failed", "review", "merged"]`: fired by the ticker's pull request poll. The body goes to the thread whose pull request changed, as a prompt, with facts the binary generates (how many checks fail, how many comments, the `gh` commands to read them). It needs no coordinator, only the open thread.
-- Every project has `routines/pr-followup.md` (`checks-failed`, `review`): it tells the thread to fix failing checks and address review comments. Turn it off in the popup's routines section; `doctor --fix` puts it back if the file is missing.
+- Every project has `routines/pr-followup.md` (`checks-failed`, `review`): it tells the thread to fix failing checks and address review comments, and ends with an `Authorized:` line that lets the thread push to its own branch and comment on that pull request, and nothing else (mstack in an OMP thread refuses a push without such a line). Turn it off in the popup's routines section; `doctor --fix` puts it back if the file is missing. A copy that is exactly an earlier default is replaced by `doctor --fix`; a copy you edited is left alone, and `doctor` says when it has no `Authorized:` line.
 
 ## Cleanup
 
@@ -186,10 +187,20 @@ herdr-projects configure --clients omp        # or claude,codex,omp
 
 `herdr-projects update` refuses on a fork build. To update, run `git -C ~/dev/herdr-projects-omp pull`, then `HERDR_PROJECTS_BUILD=source sh scripts/install.sh` in the checkout, then `herdr-projects doctor --fix`, `herdr-projects ticker stop` and `herdr-projects ticker start`.
 
-**What `configure` installs.** `configure` picks OMP by itself when its agent folder exists. The folder is `$PI_CODING_AGENT_DIR` when that is set, else `~/.omp/agent`. Named OMP profiles (`~/.omp/profiles/<name>/agent`) are not supported. If you set `PI_CODING_AGENT_DIR`, set the same value in the shell where you run `configure` and in the Herdr server's environment: the Herdr **doctor** and **configure** actions run with the server's environment, and with a different value they look in another folder and install a second copy there.
+**What `configure` installs.** `configure` picks OMP by itself when an OMP agent folder exists. It installs into every OMP profile: the default profile's agent folder is `$PI_CODING_AGENT_DIR` when that is set, else `~/.omp/agent`; a named profile's is `~/.omp/profiles/<name>/agent`, one for each such folder. OMP layouts moved to XDG folders are not supported. If you set `PI_CODING_AGENT_DIR`, set the same value in the shell where you run `configure` and in the Herdr server's environment: the Herdr **doctor** and **configure** actions run with the server's environment, and with a different value they look in another folder and install a second copy there. A profile created later gets its copy from the next `configure`.
 
-- `<agent folder>/extensions/herdr-projects.ts`, with this binary's path and root written into it. `unconfigure` removes it only when it is unchanged. `doctor` reports it as ok, outdated, missing or foreign; `doctor --fix` rewrites it only when `configure` installed it for this root; a copy left over from `unconfigure`, or one installed for another root, is reported with the command to run. A file of that name that is not ours is never touched.
-- `<agent folder>/skills/autoproject`, a link to the `autoproject` skill. It is skipped when `~/.agents/skills/autoproject` already links the same skill, because OMP reads that folder too.
+- `<agent folder>/extensions/herdr-projects.ts` in each profile, with this binary's path and root written into it. `unconfigure` removes it only when it is unchanged. `doctor` reports each profile's copy (`omp extension <profile>`) as ok, outdated, missing or foreign; `doctor --fix` rewrites it only when `configure` installed it for this root; a copy left over from `unconfigure`, or one installed for another root, is reported with the command to run. A file of that name that is not ours is never touched.
+- `<agent folder>/skills/autoproject` in each profile, a link to the `autoproject` skill. It is skipped when `~/.agents/skills/autoproject` already links the same skill, because OMP reads that folder too, in every profile.
+
+**Profiles.** A project's `omp_profile` setting (in `PROJECT.md`, `set`, or the popup's settings) picks the OMP profile its OMP coordinator and threads start with; empty, or `default`, is OMP's default profile. `open --profile <name>`, `thread start --profile <name>` and `thread restart --profile <name>` override it for one coordinator or thread, and the thread keeps its profile for later restarts; `--profile ""` goes back to the project's setting. `--profile` with another harness, or with `open --here`, is an error. The profile must exist in Herdr's `[session.omp_launchers]` on the machine that runs the agent, for example:
+
+```toml
+[session.omp_launchers]
+default = "/home/me/.local/bin/omp"
+neurable = "/home/me/.local/bin/omp-neurable"
+```
+
+A named profile needs a Herdr build with `herdr agent start --profile` (the OMP profile-recovery build, newer than 0.9.1-custom.afd9e19893db.293f3bc6a84a); the default profile works with any Herdr. `adopt` records the profile Herdr reports for the adopted pane.
 
 **What the extension does.** It runs in every OMP session and does nothing outside a Herdr pane. In the main session, not in subagents:
 
@@ -207,11 +218,13 @@ herdr-projects configure --clients omp        # or claude,codex,omp
 
 The first line of the file is `# herdr-projects: managed`, and `doctor --fix` rewrites such a file when it is out of date, for example after the binary or the root moved. To keep your own version, delete that line: the binary then never writes the file again. A file it cannot read is left alone too, and `doctor` names it, also after `--fix`; fix its permissions or remove it.
 
-OMP replaces a list setting as a whole, so in the coordinator's session this file's `bash.patterns` takes the place of any `bash.patterns` in your own OMP config (`<agent folder>/config.yml`, or `config.yaml` when there is no `config.yml`). `doctor` warns when your own config has `bash.patterns` and at least one project still has the managed file. To keep those rules for the coordinator, copy them into your own version of the file.
+OMP replaces a list setting as a whole, so in the coordinator's session this file's `bash.patterns` would take the place of the `bash.patterns` in the coordinator profile's own OMP config (`<agent folder>/config.yml`, or `config.yaml` when there is no `config.yml`). The file therefore repeats those rules after its own, so they keep applying; the project's rules come first and win. When you change that config, `doctor` shows the file as out of date and `doctor --fix` (or the next `open`) rewrites it. When that config cannot be read or parsed, the file holds only the project's rules, says so in a comment, and `doctor` names the error.
 
 Each rule starts with the exact `<binary> --root <root>` prefix the coordinator is told to use, for example `<binary> --root <root> configure *`. A slug such as `configure-ci` or a brief that mentions "delete" does not match. OMP also checks each part of a compound command, so `cd x && <binary> --root <root> sweep` still asks. The rules are advice, not a sandbox: another path to the binary, a copied or renamed binary, `sh -c '...'` and similar wrappers get past them. When the binary or root path contains a space, the prefix is quoted and the check of the parts of a compound command does not match it. A subagent of the coordinator cannot answer a confirmation, so `eval`, `debug` and the confirmed commands are refused there.
 
-**Threads.** Start an OMP thread with `--agent omp` and pick its model with `--agent-arg --model=<provider/model>[:<level>]`, for example `--agent-arg --model=anthropic/claude-opus-4-5:high`. The prompt that starts an OMP thread contains the word workflowz, which turns on OMP's workflow notice for that turn, and the brief tells the thread to run work with several independent slices as an `eval` `workpool()`.
+**Threads.** Start an OMP thread with `--agent omp` and pick its model with `--agent-arg --model=<provider/model>[:<level>]`, for example `--agent-arg --model=anthropic/claude-opus-4-5:high`. Without mstack, the prompt that starts an OMP thread contains the word workflowz, which turns on OMP's workflow notice for that turn, and the brief tells the thread to run work with several independent slices as an `eval` `workpool()`.
+
+**mstack.** The binary looks for the [mstack](https://github.com/mgpai22/mstack) OMP plugin in each profile's plugins folder (`~/.omp/plugins`, or `~/.omp/profiles/<name>/plugins`; OMP installs plugins per profile), and counts it only when it is enabled there. `doctor` shows what it found for each profile. When a local OMP thread's profile has mstack, the prompt that starts it says to route the task with `skill://mstack-mode` (falling back to `skill://mstack-figure-it-out`) in place of the workflowz text; remote threads keep the workflowz text. The coordinator's instructions tell it to plan with mstack, give each thread one worktree or folder to write, ask for verification evidence, and end every task that may push or open a pull request with an `Authorized:` line naming the branch and the target. mstack never treats its own mode as permission to push. When the coordinator's profile has mstack 0.4.0 or newer, the project folder also gets `.mstack/config.yml` (`mode: true`), because a prompt the binary queues can not run `/mstack on`. It follows the same rules as `.omp/config.yml`: first line `# herdr-projects: managed`, delete that line to keep your own version.
 
 ## Development
 

@@ -495,7 +495,7 @@ struct Pass {
     error: Option<anyhow::Error>,
 }
 
-fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread::Thread], agents: &[Agent], panes: &[Pane], hashes: Option<&std::collections::BTreeMap<String, String>>) -> Result<Pass> {
+fn thread_pass(env: &crate::paths::Env, project: &Project, herdr: &Herdr, socket: &str, threads: &[thread::Thread], agents: &[Agent], panes: &[Pane], hashes: Option<&std::collections::BTreeMap<String, String>>) -> Result<Pass> {
     let slug = &project.slug;
     let now = jiff::Timestamp::now();
     let mut pass = Pass { transitions: Vec::new(), recorded_panes: 0, missing_panes: 0, error: None };
@@ -535,7 +535,7 @@ fn thread_pass(project: &Project, herdr: &Herdr, socket: &str, threads: &[thread
             // Queued for the OMP extension counts as delivered: it hands the
             // brief over itself, or the fallback types it.
             let routed = crate::delivery::routed(&project.root, socket, &t.pane_id, t.is_remote());
-            match crate::delivery::send(&project.root, herdr, socket, &t.pane_id, routed, "brief", &thread::launch_prompt(slug, &t.id, &t.agent)) {
+            match crate::delivery::send(&project.root, herdr, socket, &t.pane_id, routed, "brief", &thread::launch_prompt(slug, &t.id, &t.agent, t.uses_mstack(env))) {
                 Ok(_) => delivered = true,
                 Err(error) => pass.error = pass.error.or(Some(anyhow::anyhow!("{}: brief prompt: {error}", t.id))),
             }
@@ -632,7 +632,7 @@ fn launch_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, threads: &[thread::T
             }
             let mut args = safety.thread_agent_args.clone();
             args.extend(model);
-            herdr.on_machine(&t.machine).agent_start(&t.agent_name, &t.agent, &t.pane_id, &args)?;
+            herdr.on_machine(&t.machine).agent_start(&t.agent_name, &t.agent, &t.omp_profile, &t.pane_id, &args)?;
             Ok(())
         })();
         errors.extend(launched.err().map(|e| e.context(format!("{}: launch", t.id))));
@@ -673,15 +673,16 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
     if coordinators != previous {
         coordinator::save_live(project, &coordinators)?;
     }
-    // The primary pane's native session id, for a later resume by `open`.
+    // The primary pane's native session id and profile, for a later resume by `open`.
     if let Some(primary) = coordinators.iter().find(|c| c.pane_id == record.pane_id)
         && !primary.agent_session.is_empty()
-        && (primary.agent_session != record.agent_session || primary.agent != record.agent)
+        && (primary.agent_session != record.agent_session || primary.agent != record.agent || primary.omp_profile != record.omp_profile)
     {
-        let (session_id, kind) = (primary.agent_session.clone(), primary.agent.clone());
+        let (session_id, kind, profile) = (primary.agent_session.clone(), primary.agent.clone(), primary.omp_profile.clone());
         project.update_coordinator(|c| {
             c.agent_session = session_id;
             c.agent = kind;
+            c.omp_profile = profile;
         })?;
     }
     let name = project.read_project_md().map(|(s, _)| project::display_name(&s.name, slug)).unwrap_or_else(|_| slug.clone());
@@ -692,7 +693,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
         crate::sidebar::report_pane(&herdr, &c.pane_id, &crate::sidebar::coordinator_display(&name), slug, group, &line);
     }
 
-    let pass = thread_pass(project, &herdr, &record.socket, &open_threads(project, false), &agents, &panes, None)?;
+    let pass = thread_pass(ctx.env, project, &herdr, &record.socket, &open_threads(project, false), &agents, &panes, None)?;
     // The project's Space row.
     if coordinator::workspace_open(&record, &panes) {
         let line = crate::sidebar::project_line(&crate::sidebar::recorded_groups(project), false);
@@ -739,6 +740,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, sessions: &mut Sessions) -> Result<O
 /// `herdr --machine`, one ssh call for every report hash, then the same thread
 /// pass, copies and launches as for local threads. If the machine cannot be
 /// reached nothing is read: no state, no group change, no copy, no inbox item.
+#[allow(clippy::too_many_arguments)]
 fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threads: &[thread::Thread], may_start: &mut bool, copy_notes: &mut std::collections::BTreeMap<String, Vec<String>>, errors: &mut Vec<anyhow::Error>) -> Result<Vec<Transition>, String> {
     let remote = herdr.on_machine(machine);
     let agents = remote.agent_list().map_err(|e| e.to_string())?;
@@ -747,7 +749,7 @@ fn remote_pass(ctx: &Ctx, project: &Project, herdr: &Herdr, machine: &str, threa
     let dirs: Vec<(String, String)> = threads.iter().filter(|t| !t.thread_dir.is_empty()).map(|t| (t.id.clone(), t.thread_dir.clone())).collect();
     let hashes = crate::remote::report_hashes(ctx.runner, &target, &dirs).map_err(|e| format!("{e:#}"))?;
 
-    let pass = thread_pass(project, &remote, "", threads, &agents, &panes, Some(&hashes)).map_err(|e| format!("{e:#}"))?;
+    let pass = thread_pass(ctx.env, project, &remote, "", threads, &agents, &panes, Some(&hashes)).map_err(|e| format!("{e:#}"))?;
     errors.extend(pass.error);
 
     for t in threads {

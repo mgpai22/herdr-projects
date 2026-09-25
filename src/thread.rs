@@ -77,6 +77,8 @@ pub struct Thread {
     pub tab_id: String,
     pub pane_id: String,
     pub agent: String,
+    /// The OMP profile herdr launches the agent with; empty = default.
+    pub omp_profile: String,
     /// A model flag for the agent CLI at launch (checked again by the ticker),
     /// appended after the project's `thread_agent_args` safety setting.
     pub agent_args: Vec<String>,
@@ -107,6 +109,13 @@ pub struct Thread {
 impl Thread {
     pub fn is_remote(&self) -> bool {
         !self.machine.is_empty()
+    }
+
+    /// True when the thread's launch prompt routes through mstack: a local OMP
+    /// thread whose profile has mstack installed and enabled. A remote
+    /// machine's plugins cannot be read from here, so remote threads keep workflowz.
+    pub fn uses_mstack(&self, env: &crate::paths::Env) -> bool {
+        !self.is_remote() && self.agent == "omp" && crate::omp::mstack_version(env, &self.omp_profile).is_some()
     }
 
     pub fn report_path(&self) -> String {
@@ -284,9 +293,15 @@ pub fn thread_dir(cwd: &str, slug: &str, id: &str) -> String {
 /// The one line the agent is prompted with; the relative path is the same for
 /// every kind. Nothing from outside is ever placed in a prompt. OMP turns on
 /// its workflow notice only for the bare word in a user prompt (not in the
-/// brief file, not in backticks), so an OMP thread gets it here.
-pub fn launch_prompt(slug: &str, id: &str, agent: &str) -> String {
-    let workflow = if agent == "omp" { " Use workflowz for multi-slice work." } else { "" };
+/// brief file, not in backticks), so an OMP thread gets it here; with mstack
+/// the prompt names its router instead. No push or PR words: mstack refuses
+/// external effects asked for in the prompt itself.
+pub fn launch_prompt(slug: &str, id: &str, agent: &str, mstack: bool) -> String {
+    let workflow = match (agent, mstack) {
+        ("omp", true) => " Route the task with skill://mstack-mode; if no playbook fits, use skill://mstack-figure-it-out.",
+        ("omp", false) => " Use workflowz for multi-slice work.",
+        _ => "",
+    };
     format!("Read .herdr-project/{slug}-{id}/brief.md and do what it says.{workflow}")
 }
 
@@ -1094,11 +1109,16 @@ mod tests {
         assert_eq!(branch_name("demo", "t-0001", "Fix the $(login) bug!"), "hp/demo/t-0001-fix-the-login-bug");
         assert_eq!(branch_name("demo", "t-0002", "???"), "hp/demo/t-0002");
         assert_eq!(thread_dir("/wt/", "demo", "t-0001"), "/wt/.herdr-project/demo-t-0001");
-        assert_eq!(launch_prompt("demo", "t-0001", "claude"), "Read .herdr-project/demo-t-0001/brief.md and do what it says.");
-        let omp = launch_prompt("demo", "t-0001", "omp");
+        assert_eq!(launch_prompt("demo", "t-0001", "claude", false), "Read .herdr-project/demo-t-0001/brief.md and do what it says.");
+        assert_eq!(launch_prompt("demo", "t-0001", "claude", true), launch_prompt("demo", "t-0001", "claude", false));
+        let omp = launch_prompt("demo", "t-0001", "omp", false);
         assert!(omp.starts_with("Read .herdr-project/demo-t-0001/brief.md and do what it says. "), "{omp}");
         // OMP's keyword needs the bare word as prose: no backticks around it.
         assert!(omp.split_whitespace().any(|w| w == "workflowz") && !omp.contains('`'), "{omp}");
+        assert_eq!(
+            launch_prompt("demo", "t-0001", "omp", true),
+            "Read .herdr-project/demo-t-0001/brief.md and do what it says. Route the task with skill://mstack-mode; if no playbook fits, use skill://mstack-figure-it-out."
+        );
     }
 
     #[test]

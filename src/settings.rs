@@ -11,11 +11,12 @@ use crate::paths::Ctx;
 use crate::project::{self, Project, Settings};
 
 /// The keys `set` accepts, with what they hold.
-pub const KEYS: [(&str, &str); 10] = [
+pub const KEYS: [(&str, &str); 11] = [
     ("name", "text"),
     ("goal", "text"),
     ("coordinator_agent", "agent kind"),
     ("thread_agent", "agent kind"),
+    ("omp_profile", "OMP profile (empty = default)"),
     ("max_parallel_threads", "number"),
     ("auto_resolve_days", "number (0 = never)"),
     ("nudge", "true/false"),
@@ -54,6 +55,22 @@ pub fn require_model_args(ctx: &Ctx, project: &Project, kind: &str, args: &[Stri
         project.slug,
         table.trim_end(),
     )
+}
+
+/// The OMP profile a launch uses, normalized: `--profile` (given empty: the
+/// project's `omp_profile`), else `fallback`. Always empty for other kinds;
+/// a named `--profile` with another kind is refused.
+pub fn launch_profile(kind: &str, flag: Option<&str>, fallback: &str, project_default: &str) -> Result<String> {
+    let named = flag.map(str::trim).filter(|f| !f.is_empty());
+    if kind != "omp" {
+        if let Some(name) = named
+            && !crate::omp::normalize_profile(name)?.is_empty()
+        {
+            bail!("--profile only applies to agent kind omp, not {kind}");
+        }
+        return Ok(String::new());
+    }
+    crate::omp::normalize_profile(named.unwrap_or(if flag.is_some() { project_default } else { fallback }))
 }
 
 /// Splits `+++` front matter from the rest, keeping both verbatim.
@@ -120,6 +137,7 @@ pub fn set_in(text: &str, key: &str, value: &str) -> Result<String> {
             }
             doc[key] = toml_edit::value(value);
         }
+        "omp_profile" => doc[key] = toml_edit::value(crate::omp::normalize_profile(value)?),
         "max_parallel_threads" | "auto_resolve_days" => {
             let n: i64 = value.parse().ok().filter(|n: &i64| *n >= 0 && *n <= 1000).with_context(|| format!("`{value}` is not a number from 0 to 1000"))?;
             if key == "max_parallel_threads" && n == 0 {
@@ -179,9 +197,9 @@ pub fn set(ctx: &Ctx, slug: &str, key: &str, value: &str) -> Result<()> {
         let _lock = project.lock()?;
         project::write_atomic(&project.project_md(), edited.as_bytes())?;
     }
-    if key == "name" {
-        // The priming file names the project.
-        let _ = project::write_priming(&project, &crate::coordinator::current_prefix(&ctx.root)?);
+    if key == "name" || key == "omp_profile" {
+        // The priming files name the project and hold the coordinator profile's rules.
+        let _ = project::write_priming(&project, &crate::coordinator::current_prefix(&ctx.root)?, ctx.env);
     }
     println!("{slug}: {key} = {value}");
     Ok(())
@@ -287,6 +305,26 @@ mod tests {
         assert!(project::parse_project_md(&muted).unwrap().0.mute);
         let goal = set_in(MD, "goal", "Ship \"it\"").unwrap();
         assert_eq!(project::parse_project_md(&goal).unwrap().0.goal, "Ship \"it\"");
+        let profile = set_in(MD, "omp_profile", " neurable ").unwrap();
+        assert_eq!(project::parse_project_md(&profile).unwrap().0.omp_profile, "neurable");
+        let default = set_in(&profile, "omp_profile", "default").unwrap();
+        assert_eq!(project::parse_project_md(&default).unwrap().0.omp_profile, "");
+        assert!(set_in(MD, "omp_profile", "../x").is_err());
+    }
+
+    #[test]
+    fn launch_profile_precedence_and_kind() {
+        // A flag wins, then the fallback; an empty flag means the project's setting.
+        assert_eq!(launch_profile("omp", Some("neurable"), "old", "proj").unwrap(), "neurable");
+        assert_eq!(launch_profile("omp", None, "old", "proj").unwrap(), "old");
+        assert_eq!(launch_profile("omp", Some(""), "old", "proj").unwrap(), "proj");
+        assert_eq!(launch_profile("omp", Some("default"), "old", "proj").unwrap(), "");
+        assert!(launch_profile("omp", Some("Bad Name"), "", "").is_err());
+        // Other kinds never carry a profile, and refuse a named one.
+        assert_eq!(launch_profile("claude", None, "old", "proj").unwrap(), "");
+        assert_eq!(launch_profile("claude", Some(""), "old", "proj").unwrap(), "");
+        assert_eq!(launch_profile("claude", Some("default"), "", "").unwrap(), "");
+        assert!(launch_profile("claude", Some("neurable"), "", "").unwrap_err().to_string().contains("only applies to agent kind omp"));
     }
 
     #[test]

@@ -302,7 +302,7 @@ fn thread_line(r: &ThreadRow, with_project: bool) -> String {
         parts.push(format!("on {}", t.machine));
     }
     if !t.agent.is_empty() {
-        parts.push(t.agent.clone());
+        parts.push(if t.omp_profile.is_empty() { t.agent.clone() } else { format!("{} ({})", t.agent, t.omp_profile) });
     }
     if !r.next.is_empty() {
         parts.push(format!("next: {}", r.next.len()));
@@ -423,6 +423,7 @@ pub fn build(root: &Path, section: Section, scope: Option<&str>) -> Vec<Row> {
                         ("goal", s.goal.clone()),
                         ("coordinator_agent", s.coordinator_agent.clone()),
                         ("thread_agent", s.thread_agent.clone()),
+                        ("omp_profile", s.omp_profile.clone()),
                         ("max_parallel_threads", s.max_parallel_threads.to_string()),
                         ("auto_resolve_days", s.auto_resolve_days.to_string()),
                         ("nudge", s.nudge.to_string()),

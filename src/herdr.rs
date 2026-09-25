@@ -221,6 +221,9 @@ pub struct Agent {
     pub state_change_seq: u64,
     #[serde(default)]
     pub agent_session: Option<AgentSession>,
+    /// The OMP profile herdr's hook reported; None for other kinds.
+    #[serde(default)]
+    pub launch_profile: Option<String>,
 }
 
 impl Agent {
@@ -237,6 +240,12 @@ impl Agent {
 
     pub fn session_id(&self) -> &str {
         self.agent_session.as_ref().map(|s| s.value.as_str()).unwrap_or("")
+    }
+
+    /// The reported OMP profile as records store it: "" for the default
+    /// profile, for other kinds, and for a name herdr-projects would refuse.
+    pub fn omp_profile(&self) -> String {
+        crate::omp::normalize_profile(self.launch_profile.as_deref().unwrap_or_default()).unwrap_or_default()
     }
 }
 
@@ -425,10 +434,15 @@ impl<'a> Herdr<'a> {
     }
 
     /// Starts an agent in a pane that is at a shell prompt. Success means herdr
-    /// detected the agent and it is ready for input.
-    pub fn agent_start(&self, name: &str, kind: &str, pane: &str, agent_args: &[String]) -> Result<Agent, HerdrError> {
+    /// detected the agent and it is ready for input. A non-empty `profile`
+    /// makes herdr run that OMP profile's launcher.
+    pub fn agent_start(&self, name: &str, kind: &str, profile: &str, pane: &str, agent_args: &[String]) -> Result<Agent, HerdrError> {
         let timeout_ms = AGENT_START_TIMEOUT.as_millis().to_string();
-        let mut args = vec!["agent", "start", name, "--kind", kind, "--pane", pane, "--timeout", &timeout_ms];
+        let mut args = vec!["agent", "start", name, "--kind", kind];
+        if !profile.is_empty() {
+            args.extend(["--profile", profile]);
+        }
+        args.extend(["--pane", pane, "--timeout", &timeout_ms]);
         if !agent_args.is_empty() {
             args.push("--");
             args.extend(agent_args.iter().map(String::as_str));

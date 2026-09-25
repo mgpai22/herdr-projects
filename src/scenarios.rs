@@ -154,6 +154,7 @@ fn thread_start_returns_without_an_agent_and_the_ticker_launches_then_prompts() 
             repo: Some(repo.to_string_lossy().into_owned()),
             machine: None,
             agent: None,
+            profile: None,
             kind: None,
             agent_args: vec!["--model".into(), "opus".into()],
             base: None,
@@ -336,10 +337,10 @@ fn restart_defers_to_the_ticker_and_resets_launch_attempts() {
     *world.panes.borrow_mut() = format!("[{}]", pane_json("w2", "w2:t1", "w2:p1", &cwd));
     world.runner.on("rev-parse --git-path", fail(1, "not a repo"));
 
-    let t = threads::restart(&world.ctx(), "demo", "t-0001", Some("codex"), None).unwrap();
+    let t = threads::restart(&world.ctx(), "demo", "t-0001", Some("codex"), None, None).unwrap();
     assert_eq!((t.status, t.prompt_pending, t.launch_attempts), (Status::Open, true, 0));
     assert_eq!(t.agent, "codex");
-    assert!(threads::restart(&world.ctx(), "demo", "t-0001", Some("chatgpt"), None).is_err());
+    assert!(threads::restart(&world.ctx(), "demo", "t-0001", Some("chatgpt"), None, None).is_err());
     assert!(t.error.is_empty());
     assert_eq!(world.runner.count("agent start"), 0);
     assert_eq!(world.runner.count("agent prompt"), 0);
@@ -487,7 +488,7 @@ fn thread_start_is_refused_when_paused() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
     project.set_status(project::Status::Paused).unwrap();
-    let args = StartArgs { title: "x".into(), repo: None, machine: None, agent: None, kind: None, agent_args: vec![], base: None, task: "t".into() };
+    let args = StartArgs { title: "x".into(), repo: None, machine: None, agent: None, profile: None, kind: None, agent_args: vec![], base: None, task: "t".into() };
     let error = threads::start(&world.ctx(), "demo", args).unwrap_err().to_string();
     assert!(error.contains("paused"), "{error}");
     assert!(thread::list(&project).is_empty());
@@ -502,11 +503,11 @@ fn thread_start_and_open_refuse_agent_args_other_than_a_model_flag() {
     let world = World::new();
     let project = world.project("demo", "a.sock");
     for bad in [&["--dangerously-skip-permissions"][..], &["--yolo"], &["--model"], &["--model", "--foo"], &["--model", "x", "--extra"]] {
-        let args = StartArgs { title: "x".into(), repo: None, machine: None, agent: None, kind: Some(Kind::Tab), agent_args: strings(bad), base: None, task: "t".into() };
+        let args = StartArgs { title: "x".into(), repo: None, machine: None, agent: None, profile: None, kind: Some(Kind::Tab), agent_args: strings(bad), base: None, task: "t".into() };
         let error = threads::start(&world.ctx(), "demo", args).unwrap_err().to_string();
         assert!(error.contains("--agent-arg only takes a model flag"), "{error}");
         assert!(error.contains("thread_agent_args = []") && error.contains("[safety."), "the safety table is shown: {error}");
-        let options = coordinator::OpenOptions { session: Default::default(), rebind: false, agent: None, agent_args: strings(bad), new: true, here: false };
+        let options = coordinator::OpenOptions { session: Default::default(), rebind: false, agent: None, profile: None, agent_args: strings(bad), new: true, here: false };
         let error = coordinator::open(&world.ctx(), "demo", &options).unwrap_err().to_string();
         assert!(error.contains("--agent-arg only takes a model flag"), "{error}");
     }
@@ -555,16 +556,16 @@ fn restart_keeps_the_model_and_refuses_other_flags() {
     world.runner.on("rev-parse --git-path", fail(1, "not a repo"));
     let ctx = world.ctx();
 
-    let t = threads::restart(&ctx, "demo", "t-0001", None, None).unwrap();
+    let t = threads::restart(&ctx, "demo", "t-0001", None, None, None).unwrap();
     assert_eq!(t.agent_args, ["-m", "gpt-5.5"]);
-    let error = threads::restart(&ctx, "demo", "t-0001", None, Some(strings(&["--yolo"]))).unwrap_err().to_string();
+    let error = threads::restart(&ctx, "demo", "t-0001", None, None, Some(strings(&["--yolo"]))).unwrap_err().to_string();
     assert!(error.contains("only takes a model flag"), "{error}");
     // `-m` is Codex's alone: refused when the restart switches to Claude, and nothing changed.
-    assert!(threads::restart(&ctx, "demo", "t-0001", Some("claude"), Some(strings(&["-m", "opus"]))).is_err());
+    assert!(threads::restart(&ctx, "demo", "t-0001", Some("claude"), None, Some(strings(&["-m", "opus"]))).is_err());
     let t = thread::load(&project, "t-0001").unwrap();
     assert_eq!((t.agent.as_str(), t.agent_args.clone()), ("codex", strings(&["-m", "gpt-5.5"])));
     thread::update(&project, "t-0001", |t| t.status = Status::Failed).unwrap();
-    let t = threads::restart(&ctx, "demo", "t-0001", Some("claude"), Some(strings(&["--model=opus"]))).unwrap();
+    let t = threads::restart(&ctx, "demo", "t-0001", Some("claude"), None, Some(strings(&["--model=opus"]))).unwrap();
     assert_eq!((t.agent.as_str(), t.agent_args), ("claude", strings(&["--model=opus"])));
 }
 
@@ -1341,7 +1342,7 @@ fn a_remote_thread_blocked_at_a_poll_is_waiting_on_you_at_once() {
 fn a_remote_thread_without_a_repo_is_refused() {
     let world = World::new();
     world.project("demo", "a.sock");
-    let args = StartArgs { title: "x".into(), repo: None, machine: Some("box".into()), agent: None, kind: None, agent_args: vec![], base: None, task: "t".into() };
+    let args = StartArgs { title: "x".into(), repo: None, machine: Some("box".into()), agent: None, profile: None, kind: None, agent_args: vec![], base: None, task: "t".into() };
     assert!(threads::start(&world.ctx(), "demo", args).unwrap_err().to_string().contains("needs --repo"));
 }
 
@@ -1354,6 +1355,7 @@ fn open_alive(world: &World, project: &Project) -> anyhow::Result<()> {
         session: crate::paths::SessionFlags { session: None, socket: Some(socket) },
         rebind: false,
         agent: None,
+        profile: None,
         agent_args: Vec::new(),
         new: false,
         here: false,
@@ -1421,6 +1423,7 @@ fn open_starts_a_coordinator_without_a_priming_prompt_then_focuses_it_and_resume
         session: crate::paths::SessionFlags { session: None, socket: Some(socket.clone()) },
         rebind: false,
         agent: None,
+        profile: None,
         agent_args: Vec::new(),
         new,
         here: false,
@@ -1485,6 +1488,7 @@ fn open_new_starts_a_fresh_coordinator_beside_a_live_one_without_its_session() {
         session: crate::paths::SessionFlags { session: None, socket: Some(socket.clone()) },
         rebind: false,
         agent: None,
+        profile: None,
         agent_args: Vec::new(),
         new,
         here: false,
@@ -1524,7 +1528,7 @@ fn a_tab_thread_gets_a_brief_with_the_project_header_and_prompts_are_recorded() 
     world.runner.on("pane get", ok(r#"{"result":{"pane":{"cwd":""}}}"#));
     world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
     let ctx = world.ctx();
-    let t = threads::start(&ctx, "demo", StartArgs { title: "Research".into(), repo: None, machine: None, agent: None, kind: Some(Kind::Tab), agent_args: vec![], base: None, task: "Look into it.".into() }).unwrap();
+    let t = threads::start(&ctx, "demo", StartArgs { title: "Research".into(), repo: None, machine: None, agent: None, profile: None, kind: Some(Kind::Tab), agent_args: vec![], base: None, task: "Look into it.".into() }).unwrap();
     assert_eq!(t.kind, Kind::Tab);
     let brief = std::fs::read_to_string(Path::new(&t.thread_dir).join("brief.md")).unwrap();
     assert!(brief.starts_with("# Project\n\n- Project: Demo (`demo`)\n- Goal: Ship it\n- Repos: (none)\n- Uploads"), "{brief}");
@@ -1632,6 +1636,7 @@ impl Here {
             session: crate::paths::SessionFlags { session: None, socket: Some(self.socket.clone()) },
             rebind: false,
             agent: None,
+            profile: None,
             agent_args: Vec::new(),
             new,
             here,
@@ -1753,7 +1758,7 @@ fn a_tab_thread_of_a_coordinator_running_in_another_workspace_opens_the_project_
     h.open(true, false).unwrap();
     let folder = h.project.dir().join("threads/t-0001");
     h.world.runner.on("pane get", ok(r#"{"result":{"pane":{"cwd":""}}}"#));
-    let args = |title: &str| StartArgs { title: title.into(), repo: None, machine: None, agent: None, kind: Some(Kind::Tab), agent_args: vec![], base: None, task: "Look.".into() };
+    let args = |title: &str| StartArgs { title: title.into(), repo: None, machine: None, agent: None, profile: None, kind: Some(Kind::Tab), agent_args: vec![], base: None, task: "Look.".into() };
     let t = threads::start(&h.world.ctx(), "demo", args("Research")).unwrap();
     let calls = h.world.runner.calls.borrow();
     let create = calls.iter().filter(|c| c.display().contains("workspace create")).last().unwrap();
@@ -1977,7 +1982,7 @@ fn a_brief_is_queued_while_the_omp_extension_pulls_and_typed_once_it_stopped() {
         let queued = crate::delivery::pending(&world.root, &socket, "w2:p1");
         assert_eq!(queued.len(), 1 - typed);
         if typed == 0 {
-            assert_eq!((queued[0].kind.as_str(), queued[0].text.as_str()), ("brief", thread::launch_prompt("demo", "t-0001", "claude").as_str()));
+            assert_eq!((queued[0].kind.as_str(), queued[0].text.as_str()), ("brief", thread::launch_prompt("demo", "t-0001", "claude", false).as_str()));
         }
         // Queued is delivered: no second send, and the thread is Working.
         let t = thread::load(&project, "t-0001").unwrap();
@@ -2086,4 +2091,167 @@ fn a_remote_brief_is_typed_even_when_a_local_channel_for_its_pane_id_is_live() {
         assert!(crate::delivery::pending(&scripted.root, s, "w2:p1").is_empty());
     }
     assert!(!thread::load(&project, "t-0001").unwrap().prompt_pending);
+}
+
+fn omp_agent_json(workspace: &str, tab: &str, pane: &str, cwd: &str, name: &str, state: &str, profile: &str) -> String {
+    format!(
+        r#"{{"pane_id":"{pane}","tab_id":"{tab}","workspace_id":"{workspace}","cwd":"{cwd}","name":"{name}","agent":"omp","agent_status":"{state}","launch_profile":"{profile}"}}"#
+    )
+}
+
+fn start_calls(world: &World) -> Vec<Cmd> {
+    world.runner.calls.borrow().iter().filter(|c| c.display().contains("agent start")).cloned().collect()
+}
+
+#[test]
+fn a_thread_takes_the_project_profile_and_the_ticker_launches_with_it() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let ctx = world.ctx();
+    crate::settings::set(&ctx, "demo", "omp_profile", "neurable").unwrap();
+    *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+    let folder = project.dir().join("threads/t-0001");
+    world.runner.on_fn(
+        |cmd| cmd.display().contains("tab create"),
+        move |_| Ok(ok(&format!(r#"{{"result":{{"root_pane":{{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"{}"}}}}}}"#, folder.display()))),
+    );
+    world.runner.on("pane get", ok(r#"{"result":{"pane":{"cwd":""}}}"#));
+    world.runner.on("agent start", ok(r#"{"result":{"agent":{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1"}}}"#));
+    let args = |agent: &str, profile: Option<&str>| StartArgs { title: "Research".into(), repo: None, machine: None, agent: Some(agent.into()), profile: profile.map(str::to_string), kind: Some(Kind::Tab), agent_args: vec![], base: None, task: "Look.".into() };
+
+    let t = threads::start(&ctx, "demo", args("omp", None)).unwrap();
+    assert_eq!(t.omp_profile, "neurable");
+    // A profile is OMP's alone: refused for another kind before anything is made.
+    let error = threads::start(&ctx, "demo", args("claude", Some("neurable"))).unwrap_err().to_string();
+    assert!(error.contains("only applies to agent kind omp"), "{error}");
+    assert_eq!((thread::list(&project).len(), world.runner.count("tab create")), (1, 1));
+
+    *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(&project), pane_json("w1", "w1:t2", "w1:p2", &t.cwd));
+    ticker::tick_project(&ctx, &project).unwrap();
+    let starts = start_calls(&world);
+    assert_eq!(starts.len(), 1);
+    assert!(starts[0].args.windows(6).any(|w| w == strings(&["--kind", "omp", "--profile", "neurable", "--pane", "w1:p2"])), "{}", starts[0].display());
+}
+
+#[test]
+fn restart_sets_keeps_and_clears_the_profile() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let cwd = world.home.path().to_string_lossy().into_owned();
+    let ctx = world.ctx();
+    crate::settings::set(&ctx, "demo", "omp_profile", "neurable").unwrap();
+    world.thread(&project, world.home.path(), |t| {
+        t.status = Status::Failed;
+        t.agent = "codex".into();
+    });
+    std::fs::write(thread::task_path(&project, "t-0001"), "The task.").unwrap();
+    *world.panes.borrow_mut() = format!("[{}]", pane_json("w2", "w2:t1", "w2:p1", &cwd));
+    world.runner.on("rev-parse --git-path", fail(1, "not a repo"));
+    let restart = |agent: Option<&str>, profile: Option<&str>, args: Option<Vec<String>>| {
+        thread::update(&project, "t-0001", |t| t.status = Status::Failed).unwrap();
+        threads::restart(&ctx, "demo", "t-0001", agent, profile, args)
+    };
+    let profile_and_args = || {
+        let t = thread::load(&project, "t-0001").unwrap();
+        (t.agent, t.omp_profile, t.agent_args)
+    };
+
+    // Switching to OMP takes the project's profile.
+    restart(Some("omp"), None, Some(strings(&["--model", "opus"]))).unwrap();
+    assert_eq!(profile_and_args(), ("omp".into(), "neurable".into(), strings(&["--model", "opus"])));
+    // Another profile keeps the model flag; none given keeps the profile.
+    restart(None, Some("work"), None).unwrap();
+    restart(None, None, None).unwrap();
+    assert_eq!(profile_and_args(), ("omp".into(), "work".into(), strings(&["--model", "opus"])));
+    // An empty value goes back to the project's profile.
+    restart(None, Some(""), None).unwrap();
+    assert_eq!(profile_and_args().1, "neurable");
+    // A named profile with another kind is refused and changes nothing.
+    assert!(restart(Some("claude"), Some("work"), None).is_err());
+    assert_eq!(profile_and_args(), ("omp".into(), "neurable".into(), strings(&["--model", "opus"])));
+    assert!(restart(None, Some("Not/A/Profile"), None).is_err());
+    // Another kind carries no profile.
+    restart(Some("claude"), None, None).unwrap();
+    assert_eq!(profile_and_args(), ("claude".into(), String::new(), Vec::new()));
+}
+
+#[test]
+fn open_resumes_a_coordinator_only_under_the_same_profile() {
+    let world = World::new();
+    let project = project::create(&world.root, "demo", "Ship it", vec![]).unwrap();
+    let socket = world.home.path().join("a.sock");
+    std::fs::write(&socket, b"").unwrap();
+    world.runner.on("workspace create", ok(r#"{"result":{"root_pane":{"workspace_id":"w3","tab_id":"w3:t1","pane_id":"w3:p1"}}}"#));
+    world.runner.on("tab rename", ok(r#"{"result":{}}"#));
+    world.runner.on("workspace get", ok(r#"{"result":{"workspace":{"label":"Demo"}}}"#));
+    world.runner.on("agent start", ok(r#"{"result":{"agent":{"pane_id":"w3:p1","tab_id":"w3:t1","workspace_id":"w3","name":"hpc-demo","agent":"omp","agent_status":"idle","agent_session":{"value":"sess-9"},"launch_profile":"neurable"}}}"#));
+    let options = |profile: Option<&str>| crate::coordinator::OpenOptions {
+        session: crate::paths::SessionFlags { session: None, socket: Some(socket.clone()) },
+        rebind: false,
+        agent: Some("omp".into()),
+        profile: profile.map(str::to_string),
+        agent_args: Vec::new(),
+        new: false,
+        here: false,
+    };
+    let ctx = world.ctx();
+
+    crate::coordinator::open(&ctx, "demo", &options(Some("neurable"))).unwrap();
+    let start = start_calls(&world).pop().unwrap();
+    assert!(start.display().starts_with("herdr agent start hpc-demo --kind omp --profile neurable --pane w3:p1"), "{}", start.display());
+    let record = project.coordinator().unwrap();
+    assert_eq!((record.omp_profile.as_str(), record.agent_session.as_str()), ("neurable", "sess-9"));
+
+    // The pane is gone: the same profile resumes the session through its launcher.
+    crate::coordinator::open(&ctx, "demo", &options(Some("neurable"))).unwrap();
+    let start = start_calls(&world).pop().unwrap();
+    assert!(start.display().contains("--profile neurable") && start.args.ends_with(&strings(&["--", "--resume=sess-9"])), "{}", start.display());
+
+    // The project's default profile has its own sessions: a fresh start, no --profile.
+    crate::coordinator::open(&ctx, "demo", &options(None)).unwrap();
+    let start = start_calls(&world).pop().unwrap();
+    assert!(!start.display().contains("--profile") && !start.display().contains("--resume"), "{}", start.display());
+    assert_eq!(project.coordinator().unwrap().omp_profile, "");
+    assert!(crate::coordinator::open(&ctx, "demo", &crate::coordinator::OpenOptions { agent: Some("claude".into()), ..options(Some("neurable")) }).is_err());
+    assert_eq!(start_calls(&world).len(), 3);
+}
+
+#[test]
+fn an_omp_thread_is_routed_through_mstack_only_when_its_profile_has_it() {
+    let world = World::new();
+    let project = world.project("demo", "a.sock");
+    let cwd = world.home.path().join("wt");
+    std::fs::create_dir(&cwd).unwrap();
+    let wt = cwd.to_string_lossy().into_owned();
+    world.thread(&project, &cwd, |t| {
+        t.agent = "omp".into();
+        t.prompt_pending = true;
+    });
+    *world.panes.borrow_mut() = format!("[{},{}]", world.coordinator_pane(&project), pane_json("w2", "w2:t1", "w2:p1", &wt));
+    *world.agents.borrow_mut() = format!("[{}]", omp_agent_json("w2", "w2:t1", "w2:p1", &wt, "hp-demo-t-0001", "idle", "default"));
+    world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+    let ctx = world.ctx();
+    let last_prompt = || world.runner.calls.borrow().iter().rfind(|c| c.display().contains("agent prompt")).unwrap().args.last().unwrap().clone();
+
+    ticker::tick_project(&ctx, &project).unwrap();
+    assert_eq!(last_prompt(), thread::launch_prompt("demo", "t-0001", "omp", false));
+
+    // mstack installed and enabled for the default profile.
+    let plugins = world.home.path().join(".omp/plugins");
+    std::fs::create_dir_all(plugins.join("node_modules/@mgpai22/mstack")).unwrap();
+    std::fs::write(plugins.join("node_modules/@mgpai22/mstack/package.json"), r#"{"name":"@mgpai22/mstack","version":"0.4.0"}"#).unwrap();
+    std::fs::write(plugins.join("omp-plugins.lock.json"), r#"{"plugins":{"@mgpai22/mstack":{"version":"0.4.0","enabled":true}}}"#).unwrap();
+    thread::update(&project, "t-0001", |t| t.prompt_pending = true).unwrap();
+    ticker::tick_project(&ctx, &project).unwrap();
+    assert_eq!(last_prompt(), thread::launch_prompt("demo", "t-0001", "omp", true));
+
+    // Another profile without it keeps workflowz.
+    thread::update(&project, "t-0001", |t| {
+        t.prompt_pending = true;
+        t.omp_profile = "neurable".into();
+    })
+    .unwrap();
+    ticker::tick_project(&ctx, &project).unwrap();
+    assert_eq!(last_prompt(), thread::launch_prompt("demo", "t-0001", "omp", false));
+    assert_eq!(world.runner.count("agent prompt"), 3);
 }
